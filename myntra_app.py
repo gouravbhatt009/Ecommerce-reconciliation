@@ -111,7 +111,8 @@ MONEY_COLS_PG = [
     'amount_pending_settlement','prepaid_amount','postpaid_amount',
     'tcs_amount','tds_amount','commission_percentage','platform_fees',
     'shipping_fee','customer_paid_amt','taxable_amount',
-    'prepaid_payment','postpaid_payment'
+    'prepaid_payment','postpaid_payment',
+    'total_commission_plus_tcs_tds_deduction'
 ]
 MONEY_COLS_SALES = [
     'invoiceamount','shipment_value','base_value','seller_price','mrp',
@@ -162,15 +163,42 @@ if not (up_fwd and up_rev and up_sales):
     )
     st.stop()
 
+def read_excel_safe(file):
+    """Try openpyxl first, then xlrd, then ask user to convert to CSV."""
+    fname = file.name.lower()
+    if not fname.endswith(('.xlsx', '.xls')):
+        return pd.read_csv(file)
+    # Try openpyxl (for .xlsx)
+    try:
+        import openpyxl  # noqa
+        file.seek(0)
+        return pd.read_excel(file, engine='openpyxl')
+    except ImportError:
+        pass
+    # Try xlrd (older .xls support)
+    try:
+        import xlrd  # noqa
+        file.seek(0)
+        return pd.read_excel(file, engine='xlrd')
+    except ImportError:
+        pass
+    # Both missing — give user a clear action
+    st.error(
+        "❌ **Cannot read the Excel file** — neither `openpyxl` nor `xlrd` is installed "
+        "in this environment.\n\n"
+        "**Quick fix:** Open your Sales sheet in Excel, go to **File → Save As → CSV (.csv)**, "
+        "then re-upload the CSV version instead."
+    )
+    st.stop()
+
 try:
-    pg_fwd  = coerce_df(pd.read_csv(up_fwd), MONEY_COLS_PG)
-    pg_rev  = coerce_df(pd.read_csv(up_rev), MONEY_COLS_PG)
-    if up_sales.name.lower().endswith(('.xlsx', '.xls')):
-        sales = coerce_df(pd.read_excel(up_sales), MONEY_COLS_SALES)
-    else:
-        sales = coerce_df(pd.read_csv(up_sales), MONEY_COLS_SALES)
+    pg_fwd = coerce_df(pd.read_csv(up_fwd), MONEY_COLS_PG)
+    pg_rev = coerce_df(pd.read_csv(up_rev), MONEY_COLS_PG)
+    sales  = coerce_df(read_excel_safe(up_sales), MONEY_COLS_SALES)
     pg_fwd['_type'] = 'Forward'
     pg_rev['_type'] = 'Return'
+except SystemExit:
+    raise
 except Exception as e:
     st.error(f"❌ Error reading uploaded files: {e}")
     st.stop()
@@ -195,9 +223,10 @@ tabs = st.tabs([
     "📦 SKU & Product",
     "🌍 Geography",
     "💸 Charges Breakup",
+    "✅ Order Settlement Checker",
 ])
 (t_overview, t_recon, t_sales, t_returns,
- t_settle, t_sku, t_geo, t_charges) = tabs
+ t_settle, t_sku, t_geo, t_charges, t_checker) = tabs
 
 # ══════════════════════════════════════════════
 # TAB 1 — OVERVIEW
@@ -830,3 +859,243 @@ st.markdown(
     "PG Forward + Reverse + Sales Reconciliation",
     unsafe_allow_html=True
 )
+
+# ══════════════════════════════════════════════
+# TAB 9 — ORDER SETTLEMENT CHECKER
+# ══════════════════════════════════════════════
+with t_checker:
+    st.markdown('<div class="section-title">✅ Order-wise Settlement Checker</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#f0f9ff;border-left:4px solid #3b82f6;padding:12px 16px;border-radius:4px;margin-bottom:16px;font-size:0.9rem;">
+    <b>Formula applied per order:</b><br>
+    <code>Calculated Payment = seller_price (Sales) − total_commission_plus_tcs_tds_deduction − total_logistics_deduction</code><br><br>
+    <b>Settlement Check:</b> Calculated Payment is then compared against <code>total_actual_settlement</code> (PG Forward Col AO).<br>
+    Orders are flagged as ✅ Matched, ⚠️ Difference, or 🕐 Pending based on the gap.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Join Sales (order_release_id = col F) with PG Forward (order_release_id = col A) ──
+    # Detect the order ID column in sales sheet — could be 'order_release_id', 'order_id', or column F
+    sales_id_col = None
+    for candidate in ['order_release_id', 'order_id', 'orderreleaseid', 'Order_Release_Id']:
+        if candidate in sales.columns:
+            sales_id_col = candidate
+            break
+    if sales_id_col is None:
+        # Fallback: use column index F (index 5)
+        sales_id_col = sales.columns[5]
+        st.info(f"ℹ️ Using column **'{sales_id_col}'** (Col F) as Order ID from Sales sheet.")
+
+    # Detect seller_price column — col AU
+    sales_price_col = None
+    for candidate in ['seller_price', 'Seller_Price', 'seller price']:
+        if candidate in sales.columns:
+            sales_price_col = candidate
+            break
+    if sales_price_col is None:
+        # Fallback: column AU = index 46
+        if len(sales.columns) > 46:
+            sales_price_col = sales.columns[46]
+            st.info(f"ℹ️ Using column **'{sales_price_col}'** (Col AU) as Seller Price from Sales sheet.")
+        else:
+            st.error("❌ Could not find seller_price column in Sales sheet. Please check column AU.")
+            st.stop()
+
+    # Build sales lookup: order_id → seller_price
+    sales_lookup = sales[[sales_id_col, sales_price_col]].copy()
+    sales_lookup[sales_id_col]   = sales_lookup[sales_id_col].astype(str).str.strip()
+    sales_lookup[sales_price_col] = safe_num(sales_lookup[sales_price_col])
+    sales_lookup = sales_lookup.drop_duplicates(subset=[sales_id_col])
+    sales_lookup.columns = ['order_release_id', 'seller_price']
+
+    # Build PG Forward working set
+    needed_pg = ['order_release_id', 'packet_id', 'sku_code', 'article_type',
+                 'total_commission_plus_tcs_tds_deduction', 'total_logistics_deduction',
+                 'total_actual_settlement', 'total_expected_settlement',
+                 'amount_pending_settlement', 'seller_product_amount']
+    available_pg = [c for c in needed_pg if c in pg_fwd.columns]
+    pg_work = pg_fwd[available_pg].copy()
+    pg_work['order_release_id'] = pg_work['order_release_id'].astype(str).str.strip()
+
+    # Merge
+    checker_df = pg_work.merge(sales_lookup, on='order_release_id', how='left')
+
+    # ── Apply formula ──
+    # If total_commission_plus_tcs_tds_deduction is missing, build it from components
+    if 'total_commission_plus_tcs_tds_deduction' not in checker_df.columns or checker_df['total_commission_plus_tcs_tds_deduction'].fillna(0).abs().sum() == 0:
+        for c in ['total_commission', 'tcs_amount', 'tds_amount']:
+            if c not in checker_df.columns:
+                checker_df[c] = 0
+        checker_df['total_commission_plus_tcs_tds_deduction'] = (
+            safe_num(checker_df.get('total_commission', 0)).abs() +
+            safe_num(checker_df.get('tcs_amount', 0)).abs() +
+            safe_num(checker_df.get('tds_amount', 0)).abs()
+        )
+        st.info("ℹ️ `total_commission_plus_tcs_tds_deduction` column not found — computed from commission + TCS + TDS.")
+
+    checker_df['comm_tcs_tds']   = safe_num(checker_df['total_commission_plus_tcs_tds_deduction']).abs()
+    checker_df['logistics']      = safe_num(checker_df['total_logistics_deduction']).abs()
+    checker_df['seller_price']   = safe_num(checker_df['seller_price'])
+    checker_df['actual_settle']  = safe_num(checker_df['total_actual_settlement'])
+    checker_df['expected_settle']= safe_num(checker_df.get('total_expected_settlement', 0))
+    checker_df['pending']        = safe_num(checker_df.get('amount_pending_settlement', 0))
+
+    # Core formula
+    checker_df['Calculated_Payment'] = (
+        checker_df['seller_price'] - checker_df['comm_tcs_tds'] - checker_df['logistics']
+    ).round(2)
+
+    checker_df['Difference_Rs'] = (
+        checker_df['Calculated_Payment'] - checker_df['actual_settle']
+    ).round(2)
+
+    # Status classification
+    def settlement_status(row):
+        if abs(row['Difference_Rs']) <= 2:          # allow ₹2 rounding tolerance
+            return '✅ Matched'
+        elif row['pending'] > 0:
+            return '🕐 Settlement Pending'
+        elif row['seller_price'] == 0:
+            return '❓ No Sales Data'
+        elif row['Difference_Rs'] > 2:
+            return '⚠️ Underpaid'
+        else:
+            return '⚠️ Overpaid / Deduction Higher'
+
+    checker_df['Status'] = checker_df.apply(settlement_status, axis=1)
+
+    # ── Summary KPIs ──
+    total_orders  = len(checker_df)
+    matched       = (checker_df['Status'] == '✅ Matched').sum()
+    underpaid     = (checker_df['Status'] == '⚠️ Underpaid').sum()
+    overpaid      = (checker_df['Status'] == '⚠️ Overpaid / Deduction Higher').sum()
+    pending_count = (checker_df['Status'] == '🕐 Settlement Pending').sum()
+    no_data       = (checker_df['Status'] == '❓ No Sales Data').sum()
+    total_diff    = checker_df['Difference_Rs'].sum()
+
+    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    k1.markdown(f"""<div class="kpi-card blue">
+        <div class="kpi-label">Total Orders</div>
+        <div class="kpi-value">{total_orders:,}</div></div>""", unsafe_allow_html=True)
+    k2.markdown(f"""<div class="kpi-card green">
+        <div class="kpi-label">✅ Matched</div>
+        <div class="kpi-value">{matched:,}</div>
+        <div class="kpi-sub">{matched/total_orders*100:.1f}%</div></div>""", unsafe_allow_html=True)
+    k3.markdown(f"""<div class="kpi-card red">
+        <div class="kpi-label">⚠️ Underpaid</div>
+        <div class="kpi-value">{underpaid:,}</div></div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi-card orange">
+        <div class="kpi-label">⚠️ Overpaid</div>
+        <div class="kpi-value">{overpaid:,}</div></div>""", unsafe_allow_html=True)
+    k5.markdown(f"""<div class="kpi-card">
+        <div class="kpi-label">🕐 Pending</div>
+        <div class="kpi-value">{pending_count:,}</div></div>""", unsafe_allow_html=True)
+    k6.markdown(f"""<div class="kpi-card {'red' if total_diff < 0 else 'green'}">
+        <div class="kpi-label">Net Diff (Calc − Actual)</div>
+        <div class="kpi-value">₹{total_diff:,.0f}</div>
+        <div class="kpi-sub">{'Shortfall' if total_diff < 0 else 'Surplus'}</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Filters ──
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        status_filter = st.multiselect(
+            "Filter by Status",
+            checker_df['Status'].unique().tolist(),
+            default=checker_df['Status'].unique().tolist(),
+            key="checker_status"
+        )
+    with col_f2:
+        search_order = st.text_input("🔍 Search Order ID / Packet ID / SKU", key="checker_search")
+    with col_f3:
+        diff_threshold = st.number_input(
+            "Show only where |Difference| > ₹", min_value=0.0, value=0.0, step=1.0, key="checker_thresh"
+        )
+
+    display_df = checker_df[checker_df['Status'].isin(status_filter)].copy()
+    if search_order:
+        mask = (
+            display_df['order_release_id'].astype(str).str.contains(search_order, case=False, na=False) |
+            display_df['packet_id'].astype(str).str.contains(search_order, case=False, na=False) |
+            display_df.get('sku_code', pd.Series(dtype=str)).astype(str).str.contains(search_order, case=False, na=False)
+        )
+        display_df = display_df[mask]
+    if diff_threshold > 0:
+        display_df = display_df[display_df['Difference_Rs'].abs() > diff_threshold]
+
+    # ── Main table ──
+    show_cols = [
+        'order_release_id', 'packet_id', 'sku_code',
+        'seller_price', 'comm_tcs_tds', 'logistics',
+        'Calculated_Payment', 'actual_settle', 'Difference_Rs',
+        'pending', 'Status'
+    ]
+    show_cols = [c for c in show_cols if c in display_df.columns]
+
+    rename_map = {
+        'order_release_id':   'Order ID',
+        'packet_id':          'Packet ID',
+        'sku_code':           'SKU',
+        'seller_price':       'Seller Price (₹)',
+        'comm_tcs_tds':       'Commission+TCS+TDS (₹)',
+        'logistics':          'Logistics (₹)',
+        'Calculated_Payment': 'Calculated Payment (₹)',
+        'actual_settle':      'Actual Settlement (₹)',
+        'Difference_Rs':      'Difference (₹)',
+        'pending':            'Pending (₹)',
+        'Status':             'Status'
+    }
+    st.dataframe(
+        display_df[show_cols].rename(columns=rename_map),
+        use_container_width=True, hide_index=True
+    )
+    st.caption(f"Showing **{len(display_df):,}** of {total_orders:,} orders  |  Tolerance: ±₹2 for 'Matched'")
+
+    # ── Formula breakdown expander ──
+    with st.expander("📐 Formula Reference"):
+        st.markdown("""
+| Step | Formula |
+|------|---------|
+| **Calculated Payment** | `Seller Price` − `total_commission_plus_tcs_tds_deduction` − `total_logistics_deduction` |
+| **Difference** | `Calculated Payment` − `total_actual_settlement` |
+| **✅ Matched** | |Difference| ≤ ₹2 (rounding tolerance) |
+| **⚠️ Underpaid** | Difference > ₹2 (you received less than calculated) |
+| **⚠️ Overpaid** | Difference < −₹2 (more deducted than expected) |
+| **🕐 Pending** | `amount_pending_settlement` > 0 |
+        """)
+        st.markdown("**Column sources:**")
+        st.markdown("- `Seller Price` → Sales Sheet, Column F (order_release_id) joined with Column AU (seller_price)")
+        st.markdown("- `total_commission_plus_tcs_tds_deduction` → PG Forward report (Expenses)")
+        st.markdown("- `total_logistics_deduction` → PG Forward report")
+        st.markdown("- `total_actual_settlement` → PG Forward report, Column AO")
+
+    # ── Summary by status ──
+    st.markdown('<div class="section-title">📊 Summary by Status</div>', unsafe_allow_html=True)
+    summary = checker_df.groupby('Status').agg(
+        Orders=('order_release_id', 'count'),
+        Total_Seller_Price=('seller_price', 'sum'),
+        Total_Calculated=('Calculated_Payment', 'sum'),
+        Total_Actual_Settlement=('actual_settle', 'sum'),
+        Total_Difference=('Difference_Rs', 'sum'),
+    ).reset_index()
+    summary = summary.round(2)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    # ── Export ──
+    export_df = display_df[show_cols].rename(columns=rename_map)
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.download_button(
+            "📥 Export Settlement Check (Excel)",
+            data=to_excel(export_df),
+            file_name="order_settlement_check.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    with ec2:
+        st.download_button(
+            "📥 Export Settlement Check (CSV)",
+            data=export_df.to_csv(index=False).encode(),
+            file_name="order_settlement_check.csv",
+            mime="text/csv"
+        )

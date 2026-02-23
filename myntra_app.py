@@ -114,7 +114,10 @@ MONEY_COLS_PG = [
     'prepaid_payment','postpaid_payment',
     'total_commission_plus_tcs_tds_deduction',
     'forwardAdditionalCharges_prepaid',
-    'forwardAdditionalCharges_postpaid'
+    'forwardAdditionalCharges_postpaid',
+    'reverseAdditionalCharges_prepaid',
+    'reverseAdditionalCharges_postpaid',
+    'total_commission_plus_tcs_tds_deduction'
 ]
 MONEY_COLS_SALES = [
     'invoiceamount','shipment_value','base_value','seller_price','mrp',
@@ -145,23 +148,27 @@ st.markdown("""
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 📂 Data Files")
-    st.markdown("Upload your Myntra PG reports and Sales sheet:")
-    up_fwd   = st.file_uploader("PG Forward (Sales) CSV",   type=["csv"])
-    up_rev   = st.file_uploader("PG Reverse (Returns) CSV", type=["csv"])
-    up_sales = st.file_uploader("Sales Sheet (XLSX/CSV)",   type=["xlsx","csv","xls"])
+    st.markdown("Upload all 5 reports:")
+    up_fwd   = st.file_uploader("1️⃣ PG Forward CSV",          type=["csv"])
+    up_rev   = st.file_uploader("2️⃣ PG Reverse CSV",          type=["csv"])
+    up_sales = st.file_uploader("3️⃣ Sales Sheet (XLSX/CSV)",  type=["xlsx","csv","xls"])
+    up_rto   = st.file_uploader("4️⃣ RTO Report (XLSX/CSV)",   type=["xlsx","csv","xls"])
+    up_rt    = st.file_uploader("5️⃣ RT Report (XLSX/CSV)",    type=["xlsx","csv","xls"])
     st.markdown("---")
     st.markdown("**About this Dashboard**")
-    st.caption("Analyzes Myntra PG Forward/Reverse reports with Sales data for order-wise payment reconciliation.")
+    st.caption("Analyzes Myntra PG Forward/Reverse + Sales/RTO/RT reports for order-wise payment reconciliation.")
 
 # ─────────────────────────────────────────────
 # Load — only from uploads, no local fallback
 # ─────────────────────────────────────────────
 if not (up_fwd and up_rev and up_sales):
     st.info(
-        "👈 **Please upload all three files in the sidebar to get started:**\n\n"
-        "1. **PG Forward (Sales) CSV** — your `PG_Forward_*.csv`\n"
-        "2. **PG Reverse (Returns) CSV** — your `PG_Reverse_*.csv`\n"
-        "3. **Sales Sheet** — your `Sales_*.xlsx` or `.csv`"
+        "👈 **Please upload the required files in the sidebar:**\n\n"
+        "1. **PG Forward CSV** — payment report for forward orders\n"
+        "2. **PG Reverse CSV** — deductions for customer returns\n"
+        "3. **Sales Sheet** — main sales report (XLSX/CSV)\n"
+        "4. **RTO Report** — courier returns (optional)\n"
+        "5. **RT Report** — customer returns (optional)"
     )
     st.stop()
 
@@ -199,6 +206,30 @@ try:
     sales  = coerce_df(read_excel_safe(up_sales), MONEY_COLS_SALES)
     pg_fwd['_type'] = 'Forward'
     pg_rev['_type'] = 'Return'
+    # RTO: order_id = Col E (index 4), rto_value = Col BM (index 64)
+    if up_rto:
+        rto_df = read_excel_safe(up_rto)
+        rto_id_col  = rto_df.columns[4]   # Col E
+        rto_val_col = rto_df.columns[64] if len(rto_df.columns) > 64 else None
+        rto_df = rto_df.rename(columns={rto_id_col: 'order_release_id'})
+        if rto_val_col:
+            rto_df = rto_df.rename(columns={rto_val_col: 'rto_value'})
+            rto_df['rto_value'] = safe_num(rto_df['rto_value'])
+        rto_df['order_release_id'] = rto_df['order_release_id'].astype(str).str.strip()
+    else:
+        rto_df = pd.DataFrame(columns=['order_release_id','rto_value'])
+    # RT: order_id = Col F (index 5) via shipment_id, rt_value = Col BC (index 54)
+    if up_rt:
+        rt_df = read_excel_safe(up_rt)
+        rt_id_col  = rt_df.columns[5]    # Col F — shipment_id = order_id
+        rt_val_col = rt_df.columns[54] if len(rt_df.columns) > 54 else None
+        rt_df = rt_df.rename(columns={rt_id_col: 'order_release_id'})
+        if rt_val_col:
+            rt_df = rt_df.rename(columns={rt_val_col: 'rt_value'})
+            rt_df['rt_value'] = safe_num(rt_df['rt_value'])
+        rt_df['order_release_id'] = rt_df['order_release_id'].astype(str).str.strip()
+    else:
+        rt_df = pd.DataFrame(columns=['order_release_id','rt_value'])
 except SystemExit:
     raise
 except Exception as e:
@@ -866,332 +897,303 @@ st.markdown(
 # TAB 9 — ORDER SETTLEMENT CHECKER
 # ══════════════════════════════════════════════
 with t_checker:
-    st.markdown('<div class="section-title">✅ Order Settlement Checker — Sales vs PG Forward</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">✅ Order Settlement Checker — Full Order Lifecycle</div>', unsafe_allow_html=True)
     st.markdown("""
     <div style="background:#f0f9ff;border-left:4px solid #3b82f6;padding:12px 16px;border-radius:4px;margin-bottom:16px;font-size:0.9rem;">
-    <b>How this works:</b> Every order from your <b>Sales Report</b> is the starting point.
-    Each order is matched to the <b>PG Forward Report</b> by Order ID.<br><br>
-    <b>Formula:</b>
-    <code>Calculated Payment = Seller Price − Commission+TCS+TDS − Logistics − Fwd Additional (Prepaid) − Fwd Additional (Postpaid)</code><br>
-    <code>Difference = Calculated Payment − total_actual_settlement (PG Forward Col AO)</code>
+    <b>How this works:</b> Every Order ID from your <b>Sales Report</b> is the starting point.
+    Each order is tagged as <b>Sales / RTO / RT</b> based on which report it appears in,
+    then matched to PG Forward / PG Reverse to show payment received vs pending.<br><br>
+    <b>PG Forward formula:</b>
+    <code>Seller Price − Commission+TCS+TDS − Logistics − Fwd Add. Prepaid − Fwd Add. Postpaid</code><br>
+    <b>PG Reverse formula:</b>
+    <code>Commission+TCS+TDS − Logistics + Rev Add. Prepaid + Rev Add. Postpaid</code>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Step 1: Detect key columns in Sales sheet ──
-    # Order ID = Col F
-    sales_id_col = None
-    for cand in ['order_release_id','Order_Release_Id','orderreleaseid','order_id']:
-        if cand in sales.columns:
-            sales_id_col = cand
-            break
-    if sales_id_col is None:
-        sales_id_col = sales.columns[5]   # fallback Col F (index 5)
-        st.info(f"Using **'{sales_id_col}'** (Col F) as Order ID from Sales sheet.")
-
-    # Seller Price = Col AU
-    sales_price_col = None
-    for cand in ['seller_price','Seller_Price']:
-        if cand in sales.columns:
-            sales_price_col = cand
-            break
-    if sales_price_col is None:
-        if len(sales.columns) > 46:
-            sales_price_col = sales.columns[46]
-            st.info(f"Using **'{sales_price_col}'** (Col AU) as Seller Price from Sales sheet.")
-        else:
-            st.error("Could not find seller_price column. Please check Col AU in Sales sheet.")
-            st.stop()
-
-    # Order status column
+    # ── Detect Sales columns ──
+    sales_id_col = next((c for c in ['order_release_id','Order_Release_Id','order_id'] if c in sales.columns), sales.columns[5])
+    sales_price_col = next((c for c in ['seller_price','Seller_Price'] if c in sales.columns),
+                           (sales.columns[46] if len(sales.columns) > 46 else None))
+    if not sales_price_col:
+        st.error("Cannot find seller_price column in Sales sheet (expected Col AU)."); st.stop()
     sales_status_col = next((c for c in ['order_status','Order_Status'] if c in sales.columns), None)
 
-    # ── Step 2: Build Sales base — one row per order ──
-    sales_cols = [sales_id_col, sales_price_col]
-    if sales_status_col:
-        sales_cols.append(sales_status_col)
-    for extra in ['SKU','sku_code','article_type','payment_method','invoiceamount']:
-        if extra in sales.columns:
-            sales_cols.append(extra)
-
-    sales_base = sales[list(dict.fromkeys(sales_cols))].copy()  # dedupe cols
+    # ── Build Sales base ──
+    s_extra = [c for c in ['payment_method','article_type','invoiceamount','SKU'] if c in sales.columns]
+    s_cols  = list(dict.fromkeys([sales_id_col, sales_price_col]
+                + ([sales_status_col] if sales_status_col else []) + s_extra))
+    sales_base = sales[s_cols].copy()
     sales_base[sales_id_col]    = sales_base[sales_id_col].astype(str).str.strip()
     sales_base[sales_price_col] = safe_num(sales_base[sales_price_col])
     sales_base = sales_base.drop_duplicates(subset=[sales_id_col])
-    sales_base = sales_base.rename(columns={
-        sales_id_col:    'order_release_id',
-        sales_price_col: 'seller_price',
-        **({' sales_status_col': 'sales_order_status'} if sales_status_col else {})
-    })
+    sales_base = sales_base.rename(columns={sales_id_col: 'order_release_id',
+                                            sales_price_col: 'seller_price'})
     if sales_status_col and sales_status_col in sales_base.columns:
         sales_base = sales_base.rename(columns={sales_status_col: 'sales_order_status'})
+    sales_base['_report_type'] = 'Sales'
+    sales_base['rto_value']    = 0.0
+    sales_base['rt_value']     = 0.0
 
-    # ── Step 3: Build PG Forward lookup ──
-    pg_cols_needed = ['order_release_id',
-                      'total_commission_plus_tcs_tds_deduction',
-                      'total_logistics_deduction',
-                      'forwardAdditionalCharges_prepaid',
-                      'forwardAdditionalCharges_postpaid',
-                      'total_actual_settlement',
-                      'total_expected_settlement',
-                      'amount_pending_settlement',
-                      'packet_id', 'sku_code']
-    pg_avail = [c for c in pg_cols_needed if c in pg_fwd.columns]
-    pg_lookup = pg_fwd[pg_avail].copy()
-    pg_lookup['order_release_id'] = pg_lookup['order_release_id'].astype(str).str.strip()
-    # Coerce numerics
-    for c in pg_avail:
-        if c not in ['order_release_id','packet_id','sku_code']:
-            pg_lookup[c] = safe_num(pg_lookup[c])
+    # ── Tag RTO orders ──
+    if not rto_df.empty and 'order_release_id' in rto_df.columns:
+        rto_ids    = set(rto_df['order_release_id'].astype(str).str.strip())
+        rto_val_map = rto_df.set_index('order_release_id')['rto_value'].to_dict() if 'rto_value' in rto_df.columns else {}
+        sales_base.loc[sales_base['order_release_id'].isin(rto_ids), '_report_type'] = 'RTO'
+        sales_base['rto_value'] = sales_base['order_release_id'].map(rto_val_map).fillna(0)
+    else:
+        rto_ids = set()
 
-    # ── Step 4: LEFT JOIN — Sales is the master ──
-    # Every Sales order appears; PG columns are NaN if no match found
-    df = sales_base.merge(pg_lookup, on='order_release_id', how='left', indicator=True)
-    df['_in_pg'] = df['_merge'] == 'both'
+    # ── Tag RT orders ──
+    if not rt_df.empty and 'order_release_id' in rt_df.columns:
+        rt_ids    = set(rt_df['order_release_id'].astype(str).str.strip())
+        rt_val_map = rt_df.set_index('order_release_id')['rt_value'].to_dict() if 'rt_value' in rt_df.columns else {}
+        sales_base.loc[sales_base['order_release_id'].isin(rt_ids), '_report_type'] = 'RT'
+        sales_base['rt_value'] = sales_base['order_release_id'].map(rt_val_map).fillna(0)
+    else:
+        rt_ids = set()
 
-    # ── Step 5: Fill numeric PG columns with 0 where no PG match ──
-    for c in ['total_commission_plus_tcs_tds_deduction','total_logistics_deduction',
-              'forwardAdditionalCharges_prepaid','forwardAdditionalCharges_postpaid',
-              'total_actual_settlement','total_expected_settlement','amount_pending_settlement']:
-        if c not in df.columns:
-            df[c] = 0.0
-        else:
-            df[c] = df[c].fillna(0.0)
+    # ── PG Forward lookup (prefixed pgf_) ──
+    pgf_need = ['order_release_id',
+                'total_commission_plus_tcs_tds_deduction','total_logistics_deduction',
+                'forwardAdditionalCharges_prepaid','forwardAdditionalCharges_postpaid',
+                'total_actual_settlement','total_expected_settlement','amount_pending_settlement']
+    pgf_avail = [c for c in pgf_need if c in pg_fwd.columns]
+    pgf_lkp   = pg_fwd[pgf_avail].copy()
+    pgf_lkp['order_release_id'] = pgf_lkp['order_release_id'].astype(str).str.strip()
+    for c in pgf_avail[1:]: pgf_lkp[c] = safe_num(pgf_lkp[c])
+    pgf_lkp = pgf_lkp.add_prefix('pgf_').rename(columns={'pgf_order_release_id': 'order_release_id'})
 
-    # If commission col missing/zero, build from components
-    if df['total_commission_plus_tcs_tds_deduction'].abs().sum() == 0:
-        for c in ['total_commission','tcs_amount','tds_amount']:
-            if c not in df.columns: df[c] = 0
-        df['total_commission_plus_tcs_tds_deduction'] = (
-            safe_num(df.get('total_commission',0)).abs() +
-            safe_num(df.get('tcs_amount',0)).abs() +
-            safe_num(df.get('tds_amount',0)).abs()
-        )
+    # ── PG Reverse lookup (prefixed pgr_) ──
+    pgr_need = ['order_release_id',
+                'total_commission_plus_tcs_tds_deduction','total_logistics_deduction',
+                'reverseAdditionalCharges_prepaid','reverseAdditionalCharges_postpaid',
+                'total_actual_settlement','amount_pending_settlement']
+    pgr_avail = [c for c in pgr_need if c in pg_rev.columns]
+    pgr_lkp   = pg_rev[pgr_avail].copy()
+    pgr_lkp['order_release_id'] = pgr_lkp['order_release_id'].astype(str).str.strip()
+    for c in pgr_avail[1:]: pgr_lkp[c] = safe_num(pgr_lkp[c])
+    pgr_lkp = pgr_lkp.add_prefix('pgr_').rename(columns={'pgr_order_release_id': 'order_release_id'})
 
-    df['comm_tcs_tds']  = df['total_commission_plus_tcs_tds_deduction'].abs()
-    df['logistics']     = df['total_logistics_deduction'].abs()
-    df['add_prepaid']   = df['forwardAdditionalCharges_prepaid'].abs()
-    df['add_postpaid']  = df['forwardAdditionalCharges_postpaid'].abs()
-    df['actual_settle'] = df['total_actual_settlement']
-    df['pending']       = df['amount_pending_settlement']
+    # ── Master join: Sales LEFT JOIN PGF LEFT JOIN PGR ──
+    df = sales_base.merge(pgf_lkp, on='order_release_id', how='left')
+    df = df.merge(pgr_lkp, on='order_release_id', how='left')
+    for c in df.select_dtypes(include='number').columns:
+        df[c] = df[c].fillna(0.0)
 
-    # ── Step 6: Formula ──
-    df['Calculated_Payment'] = (
-        df['seller_price']
-        - df['comm_tcs_tds']
-        - df['logistics']
-        - df['add_prepaid']
-        - df['add_postpaid']
-    ).round(2)
+    df['_in_pgf'] = safe_num(df.get('pgf_total_actual_settlement', pd.Series(0, index=df.index))).abs() > 0
+    df['_in_pgr'] = safe_num(df.get('pgr_total_actual_settlement', pd.Series(0, index=df.index))).abs() > 0
 
-    df['Difference_Rs'] = (df['Calculated_Payment'] - df['actual_settle']).round(2)
+    # ── PG Forward formula ──
+    pgf_comm      = safe_num(df.get('pgf_total_commission_plus_tcs_tds_deduction', 0)).abs()
+    pgf_logi      = safe_num(df.get('pgf_total_logistics_deduction', 0)).abs()
+    pgf_add_pre   = safe_num(df.get('pgf_forwardAdditionalCharges_prepaid', 0)).abs()
+    pgf_add_post  = safe_num(df.get('pgf_forwardAdditionalCharges_postpaid', 0)).abs()
+    df['fwd_calculated'] = (df['seller_price'] - pgf_comm - pgf_logi - pgf_add_pre - pgf_add_post).round(2)
+    df['fwd_actual']     = safe_num(df.get('pgf_total_actual_settlement', 0))
+    df['fwd_pending']    = safe_num(df.get('pgf_amount_pending_settlement', 0))
+    df['fwd_diff']       = (df['fwd_calculated'] - df['fwd_actual']).round(2)
 
-    # ── Step 7: Status — Sales-first logic ──
-    def settlement_status(row):
-        if not row['_in_pg']:
-            # Order in Sales, ZERO record in PG Forward
-            return '🚨 Payment Not Received'
-        if row['pending'] > 0:
-            return '🕐 Settlement Pending'
-        if row['actual_settle'] == 0 and row['Calculated_Payment'] > 0:
-            return '🚨 Payment Not Received'
-        if abs(row['Difference_Rs']) <= 2:
-            return '✅ Matched'
-        if row['Difference_Rs'] > 2:
-            return '⚠️ Underpaid'
-        return '⚠️ Overpaid / Excess Deduction'
+    # ── PG Reverse formula ──
+    pgr_comm      = safe_num(df.get('pgr_total_commission_plus_tcs_tds_deduction', 0)).abs()
+    pgr_logi      = safe_num(df.get('pgr_total_logistics_deduction', 0)).abs()
+    pgr_add_pre   = safe_num(df.get('pgr_reverseAdditionalCharges_prepaid', 0)).abs()
+    pgr_add_post  = safe_num(df.get('pgr_reverseAdditionalCharges_postpaid', 0)).abs()
+    df['rev_deduction']  = (pgr_comm - pgr_logi + pgr_add_pre + pgr_add_post).round(2)
+    df['rev_actual']     = safe_num(df.get('pgr_total_actual_settlement', 0))
+    df['rev_pending']    = safe_num(df.get('pgr_amount_pending_settlement', 0))
+    df['net_payment']    = (df['fwd_actual'] + df['rev_actual']).round(2)
 
-    df['Status'] = df.apply(settlement_status, axis=1)
+    # ── Status logic ──
+    def order_status(row):
+        rtype = row['_report_type']
+        in_f  = row['_in_pgf']
+        in_r  = row['_in_pgr']
+        if rtype == 'RTO':
+            if not in_f:                      return 'RTO - No PG Forward Payment'
+            if row['fwd_pending'] > 0:        return 'RTO - Forward Pending'
+            if abs(row['fwd_diff']) <= 2:     return 'RTO - Forward Settled'
+            return 'RTO - Amount Mismatch'
+        if rtype == 'RT':
+            if not in_r:                      return 'RT - No PG Reverse Entry'
+            if row['rev_pending'] > 0:        return 'RT - Reverse Pending'
+            return 'RT - Reverse Settled'
+        # Sales
+        if not in_f:                          return 'Sales - No Payment Received'
+        if row['fwd_pending'] > 0:            return 'Sales - Settlement Pending'
+        if abs(row['fwd_diff']) <= 2:         return 'Sales - Matched'
+        if row['fwd_diff'] > 2:               return 'Sales - Underpaid'
+        return 'Sales - Overpaid'
 
-    # ── Step 8: KPIs ──
+    df['Status'] = df.apply(order_status, axis=1)
+
+    # ── KPIs ──
     total       = len(df)
-    matched     = (df['Status'] == '✅ Matched').sum()
-    not_recv    = (df['Status'] == '🚨 Payment Not Received').sum()
-    pending_n   = (df['Status'] == '🕐 Settlement Pending').sum()
-    underpaid   = (df['Status'] == '⚠️ Underpaid').sum()
-    overpaid    = (df['Status'] == '⚠️ Overpaid / Excess Deduction').sum()
-    not_recv_val= df.loc[df['Status'] == '🚨 Payment Not Received', 'seller_price'].sum()
-    pending_val = df.loc[df['Status'] == '🕐 Settlement Pending', 'pending'].sum()
-    net_diff    = df.loc[df['_in_pg'], 'Difference_Rs'].sum()
+    sales_cnt   = (df['_report_type'] == 'Sales').sum()
+    rto_cnt     = (df['_report_type'] == 'RTO').sum()
+    rt_cnt      = (df['_report_type'] == 'RT').sum()
+    matched     = df['Status'].str.contains('Settled|Matched').sum()
+    no_payment  = df['Status'].str.contains('No Payment|No PG').sum()
+    pending_cnt = df['Status'].str.contains('Pending').sum()
+    mismatch    = df['Status'].str.contains('Mismatch|Underpaid|Overpaid').sum()
+    no_pay_val  = df.loc[df['Status'].str.contains('No Payment|No PG'), 'seller_price'].sum()
+    pending_val = df.loc[df['Status'].str.contains('Pending'), 'fwd_pending'].sum() + \
+                  df.loc[df['Status'].str.contains('Pending'), 'rev_pending'].sum()
 
-    k1,k2,k3,k4,k5,k6 = st.columns(6)
-    k1.markdown(f'''<div class="kpi-card blue">
-        <div class="kpi-label">Total Sales Orders</div>
-        <div class="kpi-value">{total:,}</div>
-        <div class="kpi-sub">From Sales report</div></div>''', unsafe_allow_html=True)
-    k2.markdown(f'''<div class="kpi-card green">
-        <div class="kpi-label">✅ Matched</div>
-        <div class="kpi-value">{matched:,}</div>
-        <div class="kpi-sub">{matched/max(total,1)*100:.1f}% of orders</div></div>''', unsafe_allow_html=True)
-    k3.markdown(f'''<div class="kpi-card red">
-        <div class="kpi-label">🚨 Payment Not Received</div>
-        <div class="kpi-value">{not_recv:,}</div>
-        <div class="kpi-sub">₹{not_recv_val:,.0f} at risk</div></div>''', unsafe_allow_html=True)
-    k4.markdown(f'''<div class="kpi-card orange">
-        <div class="kpi-label">🕐 Settlement Pending</div>
-        <div class="kpi-value">{pending_n:,}</div>
-        <div class="kpi-sub">₹{pending_val:,.0f} due</div></div>''', unsafe_allow_html=True)
-    k5.markdown(f'''<div class="kpi-card red">
-        <div class="kpi-label">⚠️ Underpaid</div>
-        <div class="kpi-value">{underpaid:,}</div></div>''', unsafe_allow_html=True)
-    k6.markdown(f'''<div class="kpi-card {'red' if net_diff < 0 else 'green'}">
-        <div class="kpi-label">Net Difference</div>
-        <div class="kpi-value">₹{net_diff:,.0f}</div>
-        <div class="kpi-sub">Calc − Actual (matched orders)</div></div>''', unsafe_allow_html=True)
+    k1,k2,k3,k4,k5,k6,k7 = st.columns(7)
+    k1.markdown(f'<div class="kpi-card blue"><div class="kpi-label">Total Orders</div>'
+                f'<div class="kpi-value">{total:,}</div>'
+                f'<div class="kpi-sub">Sales:{sales_cnt} RTO:{rto_cnt} RT:{rt_cnt}</div></div>',
+                unsafe_allow_html=True)
+    k2.markdown(f'<div class="kpi-card green"><div class="kpi-label">Settled / Matched</div>'
+                f'<div class="kpi-value">{matched:,}</div>'
+                f'<div class="kpi-sub">{matched/max(total,1)*100:.1f}%</div></div>',
+                unsafe_allow_html=True)
+    k3.markdown(f'<div class="kpi-card red"><div class="kpi-label">No Payment</div>'
+                f'<div class="kpi-value">{no_payment:,}</div>'
+                f'<div class="kpi-sub">Rs {no_pay_val:,.0f} at risk</div></div>',
+                unsafe_allow_html=True)
+    k4.markdown(f'<div class="kpi-card orange"><div class="kpi-label">Settlement Pending</div>'
+                f'<div class="kpi-value">{pending_cnt:,}</div>'
+                f'<div class="kpi-sub">Rs {pending_val:,.0f} due</div></div>',
+                unsafe_allow_html=True)
+    k5.markdown(f'<div class="kpi-card orange"><div class="kpi-label">Mismatch</div>'
+                f'<div class="kpi-value">{mismatch:,}</div></div>',
+                unsafe_allow_html=True)
+    k6.markdown(f'<div class="kpi-card blue"><div class="kpi-label">RTO Orders</div>'
+                f'<div class="kpi-value">{rto_cnt:,}</div>'
+                f'<div class="kpi-sub">Courier returns</div></div>',
+                unsafe_allow_html=True)
+    k7.markdown(f'<div class="kpi-card purple"><div class="kpi-label">RT Orders</div>'
+                f'<div class="kpi-value">{rt_cnt:,}</div>'
+                f'<div class="kpi-sub">Customer returns</div></div>',
+                unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Alert banner ──
-    if not_recv > 0:
-        st.markdown(f"""
-        <div style="background:#fef2f2;border:1px solid #ef4444;border-left:6px solid #ef4444;
-             padding:14px 18px;border-radius:6px;margin-bottom:16px;">
-        <b>🚨 {not_recv} order(s) from your Sales Report have NO payment entry in PG Forward.</b><br>
-        These orders were sold but Myntra has not processed any payment for them.<br>
-        <b>Total Seller Price at risk: ₹{not_recv_val:,.2f}</b>
-        </div>
-        """, unsafe_allow_html=True)
-    if pending_n > 0:
-        st.markdown(f"""
-        <div style="background:#fffbeb;border:1px solid #f59e0b;border-left:6px solid #f59e0b;
-             padding:14px 18px;border-radius:6px;margin-bottom:16px;">
-        <b>🕐 {pending_n} order(s) are in PG Forward but settlement is still pending.</b><br>
-        <b>Total amount pending: ₹{pending_val:,.2f}</b>
-        </div>
-        """, unsafe_allow_html=True)
+    # Alert banners
+    if no_payment > 0:
+        st.markdown(
+            f'<div style="background:#fef2f2;border-left:6px solid #ef4444;padding:12px 16px;'
+            f'border-radius:6px;margin-bottom:10px;">'
+            f'<b>{no_payment} orders have NO payment entry in PG reports.</b> '
+            f'Total at risk: <b>Rs {no_pay_val:,.2f}</b></div>',
+            unsafe_allow_html=True)
+    if pending_cnt > 0:
+        st.markdown(
+            f'<div style="background:#fffbeb;border-left:6px solid #f59e0b;padding:12px 16px;'
+            f'border-radius:6px;margin-bottom:10px;">'
+            f'<b>{pending_cnt} orders have settlement pending.</b> '
+            f'Total pending: <b>Rs {pending_val:,.2f}</b></div>',
+            unsafe_allow_html=True)
 
     # ── Filters ──
-    cf1, cf2, cf3 = st.columns(3)
+    cf1, cf2, cf3, cf4 = st.columns(4)
     with cf1:
-        status_filter = st.multiselect(
-            "Filter by Status",
-            df['Status'].unique().tolist(),
-            default=df['Status'].unique().tolist(),
-            key="checker_status"
-        )
+        type_filter = st.multiselect("Order Type", ['Sales','RTO','RT'],
+                                     default=['Sales','RTO','RT'], key="chk_type")
     with cf2:
-        search_ord = st.text_input("🔍 Search by Order ID", key="checker_search")
+        status_filter = st.multiselect("Status", df['Status'].unique().tolist(),
+                                       default=df['Status'].unique().tolist(), key="chk_status")
     with cf3:
-        diff_thresh = st.number_input("Show |Difference| > ₹", min_value=0.0, value=0.0, step=1.0, key="checker_thresh")
+        search_ord = st.text_input("Search Order ID", key="chk_search")
+    with cf4:
+        diff_thresh = st.number_input("Show |Diff| > Rs", min_value=0.0, value=0.0,
+                                      step=1.0, key="chk_thresh")
 
-    display_df = df[df['Status'].isin(status_filter)].copy()
+    disp = df[df['_report_type'].isin(type_filter) & df['Status'].isin(status_filter)].copy()
     if search_ord:
-        display_df = display_df[display_df['order_release_id'].astype(str).str.contains(search_ord, case=False, na=False)]
+        disp = disp[disp['order_release_id'].astype(str).str.contains(search_ord, case=False, na=False)]
     if diff_thresh > 0:
-        display_df = display_df[display_df['Difference_Rs'].abs() > diff_thresh]
+        disp = disp[disp['fwd_diff'].abs() > diff_thresh]
 
     # ── Main table ──
-    # Pick SKU col — prefer 'SKU', fallback 'sku_code', never both (avoids duplicate col names)
-    sku_col = 'SKU' if 'SKU' in display_df.columns else ('sku_code' if 'sku_code' in display_df.columns else None)
-    show_cols = ['order_release_id']
-    for c in ['packet_id', sku_col, 'sales_order_status', 'payment_method']:
-        if c and c in display_df.columns:
-            show_cols.append(c)
-    show_cols += ['seller_price','comm_tcs_tds','logistics','add_prepaid','add_postpaid',
-                  'Calculated_Payment','actual_settle','Difference_Rs','pending','Status']
-    # Deduplicate while preserving order, then keep only cols that exist
-    seen = set()
-    show_cols = [c for c in show_cols if c not in seen and not seen.add(c)]
-    show_cols = [c for c in show_cols if c in display_df.columns]
+    main_cols = ['order_release_id', '_report_type']
+    for c in ['sales_order_status','payment_method']: 
+        if c in disp.columns: main_cols.append(c)
+    main_cols += ['seller_price','fwd_calculated','fwd_actual','fwd_diff','fwd_pending',
+                  'rev_deduction','rev_actual','rev_pending','net_payment',
+                  'rto_value','rt_value','Status']
+    main_cols = [c for c in dict.fromkeys(main_cols) if c in disp.columns]
 
-    rename_map = {
-        'order_release_id':  'Order ID (Sales)',
-        'packet_id':         'Packet ID',
-        'SKU':               'SKU',
-        'sku_code':          'SKU',
-        'sales_order_status':'Order Status',
-        'payment_method':    'Payment Method',
-        'seller_price':      'Seller Price (₹)',
-        'comm_tcs_tds':      'Commission+TCS+TDS (₹)',
-        'logistics':         'Logistics (₹)',
-        'add_prepaid':       'Fwd Add. Prepaid (₹)',
-        'add_postpaid':      'Fwd Add. Postpaid (₹)',
-        'Calculated_Payment':'Calculated Payment (₹)',
-        'actual_settle':     'Actual Settlement (₹)',
-        'Difference_Rs':     'Difference (₹)',
-        'pending':           'Pending (₹)',
-        'Status':            'Status'
+    rename_main = {
+        'order_release_id':   'Order ID',
+        '_report_type':       'Type',
+        'sales_order_status': 'Order Status',
+        'payment_method':     'Payment Method',
+        'seller_price':       'Seller Price (Rs)',
+        'fwd_calculated':     'FWD Calculated (Rs)',
+        'fwd_actual':         'FWD Received (Rs)',
+        'fwd_diff':           'FWD Difference (Rs)',
+        'fwd_pending':        'FWD Pending (Rs)',
+        'rev_deduction':      'REV Deduction (Rs)',
+        'rev_actual':         'REV Actual (Rs)',
+        'rev_pending':        'REV Pending (Rs)',
+        'net_payment':        'Net Payment (Rs)',
+        'rto_value':          'RTO Value (Rs)',
+        'rt_value':           'RT Value (Rs)',
+        'Status':             'Status'
     }
-    # Final safety: drop any duplicate column names before passing to st.dataframe
-    out_df = display_df[show_cols].rename(columns=rename_map)
-    out_df = out_df.loc[:, ~out_df.columns.duplicated()]
-    st.dataframe(out_df, use_container_width=True, hide_index=True)
-    st.caption(f"Showing **{len(display_df):,}** of {total:,} Sales orders")
+    out = disp[main_cols].rename(columns=rename_main)
+    out = out.loc[:, ~out.columns.duplicated()]
+    st.dataframe(out, use_container_width=True, hide_index=True)
+    st.caption(f"Showing {len(disp):,} of {total:,} orders  |  Tolerance Rs 2 for Matched")
 
-    # ── Dedicated table: Payment Not Received ──
-    not_recv_df = df[df['Status'] == '🚨 Payment Not Received'].copy()
-    if not not_recv_df.empty:
-        st.markdown('<div class="section-title">🚨 Orders from Sales Report — Payment Not Received from Myntra</div>', unsafe_allow_html=True)
-        st.markdown("These Order IDs exist in your **Sales Report** but have **zero entry in PG Forward** — Myntra has not processed any payment for these orders.")
-        nr_cols = ['order_release_id','seller_price']
-        for c in ['sales_order_status','payment_method','invoiceamount','article_type']:
-            if c in not_recv_df.columns: nr_cols.append(c)
-        nr_rename = {
-            'order_release_id':  'Order ID',
-            'seller_price':      'Seller Price (₹)',
-            'sales_order_status':'Order Status',
-            'payment_method':    'Payment Method',
-            'invoiceamount':     'Invoice Amount (₹)',
-            'article_type':      'Article Type'
-        }
-        _nr_out = not_recv_df[nr_cols].rename(columns=nr_rename)
-        _nr_out = _nr_out.loc[:, ~_nr_out.columns.duplicated()]
-        st.dataframe(_nr_out, use_container_width=True, hide_index=True)
-        m1, m2 = st.columns(2)
-        m1.metric("Orders with No Payment", f"{len(not_recv_df):,}")
-        m2.metric("Total Seller Price at Risk", f"₹{not_recv_df['seller_price'].sum():,.2f}")
-        st.download_button("📥 Export – Payment Not Received (Excel)",
-            data=to_excel(not_recv_df[nr_cols].rename(columns=nr_rename)),
-            file_name="payment_not_received.xlsx",
+    # ── Sub-table 1: No Payment ──
+    no_pay_df = df[df['Status'].str.contains('No Payment|No PG')].copy()
+    if not no_pay_df.empty:
+        st.markdown('<div class="section-title">Orders with No Payment Received</div>', unsafe_allow_html=True)
+        np_cols = ['order_release_id','_report_type','seller_price','rto_value','rt_value']
+        if 'sales_order_status' in no_pay_df.columns: np_cols.insert(2,'sales_order_status')
+        np_cols = [c for c in dict.fromkeys(np_cols) if c in no_pay_df.columns]
+        np_out  = no_pay_df[np_cols].rename(columns=rename_main)
+        np_out  = np_out.loc[:, ~np_out.columns.duplicated()]
+        st.dataframe(np_out, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        c1.metric("Orders", f"{len(no_pay_df):,}")
+        c2.metric("Seller Price at Risk", f"Rs {no_pay_df['seller_price'].sum():,.2f}")
+        st.download_button("Export – No Payment (Excel)", data=to_excel(np_out),
+            file_name="no_payment_orders.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # ── Dedicated table: Settlement Pending ──
-    pend_df = df[df['Status'] == '🕐 Settlement Pending'].copy()
+    # ── Sub-table 2: Settlement Pending ──
+    pend_df = df[df['Status'].str.contains('Pending')].copy()
     if not pend_df.empty:
-        st.markdown('<div class="section-title">🕐 Orders in PG Forward — Settlement Still Pending</div>', unsafe_allow_html=True)
-        st.markdown("These orders are recorded in PG Forward but `amount_pending_settlement > 0` — Myntra has acknowledged the order but not yet paid.")
-        p_cols = ['order_release_id','seller_price','Calculated_Payment','actual_settle','pending']
-        if 'sales_order_status' in pend_df.columns: p_cols.insert(2,'sales_order_status')
-        p_cols = [c for c in p_cols if c in pend_df.columns]
-        p_rename = {
-            'order_release_id':  'Order ID',
-            'seller_price':      'Seller Price (₹)',
-            'sales_order_status':'Order Status',
-            'Calculated_Payment':'Calculated Payment (₹)',
-            'actual_settle':     'Actual Settlement (₹)',
-            'pending':           'Amount Pending (₹)'
-        }
-        _p_out = pend_df[p_cols].rename(columns=p_rename)
-        _p_out = _p_out.loc[:, ~_p_out.columns.duplicated()]
-        st.dataframe(_p_out, use_container_width=True, hide_index=True)
-        st.metric("Total Pending Amount", f"₹{pend_df['pending'].sum():,.2f}")
-        st.download_button("📥 Export – Pending Settlement (Excel)",
-            data=to_excel(pend_df[p_cols].rename(columns=p_rename)),
-            file_name="settlement_pending.xlsx",
+        st.markdown('<div class="section-title">Orders with Settlement Pending</div>', unsafe_allow_html=True)
+        pend_cols = ['order_release_id','_report_type','seller_price',
+                     'fwd_calculated','fwd_actual','fwd_pending','rev_pending','Status']
+        if 'sales_order_status' in pend_df.columns: pend_cols.insert(2,'sales_order_status')
+        pend_cols = [c for c in dict.fromkeys(pend_cols) if c in pend_df.columns]
+        pend_out  = pend_df[pend_cols].rename(columns=rename_main)
+        pend_out  = pend_out.loc[:, ~pend_out.columns.duplicated()]
+        st.dataframe(pend_out, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        c1.metric("Orders Pending", f"{len(pend_df):,}")
+        c2.metric("Total Pending", f"Rs {(pend_df['fwd_pending'].sum() + pend_df['rev_pending'].sum()):,.2f}")
+        st.download_button("Export – Pending Settlement (Excel)", data=to_excel(pend_out),
+            file_name="pending_settlement.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # ── Summary table ──
-    st.markdown('<div class="section-title">📊 Summary by Status</div>', unsafe_allow_html=True)
-    summary = df.groupby('Status').agg(
-        Orders=('order_release_id','count'),
-        Total_Seller_Price=('seller_price','sum'),
-        Total_Calculated=('Calculated_Payment','sum'),
-        Total_Actual_Settlement=('actual_settle','sum'),
-        Total_Difference=('Difference_Rs','sum'),
-        Total_Pending=('pending','sum'),
+    # ── Summary by Type x Status ──
+    st.markdown('<div class="section-title">Summary by Order Type and Status</div>', unsafe_allow_html=True)
+    summary = df.groupby(['_report_type','Status']).agg(
+        Orders       =('order_release_id','count'),
+        Seller_Price =('seller_price','sum'),
+        FWD_Received =('fwd_actual','sum'),
+        FWD_Pending  =('fwd_pending','sum'),
+        REV_Deduction=('rev_actual','sum'),
+        Net_Payment  =('net_payment','sum'),
     ).reset_index().round(2)
-    summary = summary.loc[:, ~summary.columns.duplicated()]
+    summary.columns = ['Type','Status','Orders','Seller Price (Rs)','FWD Received (Rs)',
+                       'FWD Pending (Rs)','REV Deduction (Rs)','Net Payment (Rs)']
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
     # ── Full export ──
     ec1, ec2 = st.columns(2)
     with ec1:
-        st.download_button("📥 Export All Orders (Excel)",
-            data=to_excel(display_df[show_cols].rename(columns=rename_map)),
-            file_name="order_settlement_check.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("Export All Orders (Excel)", data=to_excel(out),
+            file_name="full_order_settlement.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with ec2:
-        st.download_button("📥 Export All Orders (CSV)",
-            data=display_df[show_cols].rename(columns=rename_map).to_csv(index=False).encode(),
-            file_name="order_settlement_check.csv", mime="text/csv"
-        )
+        st.download_button("Export All Orders (CSV)",
+            data=out.to_csv(index=False).encode(),
+            file_name="full_order_settlement.csv", mime="text/csv")

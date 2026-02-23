@@ -112,7 +112,9 @@ MONEY_COLS_PG = [
     'tcs_amount','tds_amount','commission_percentage','platform_fees',
     'shipping_fee','customer_paid_amt','taxable_amount',
     'prepaid_payment','postpaid_payment',
-    'total_commission_plus_tcs_tds_deduction'
+    'total_commission_plus_tcs_tds_deduction',
+    'forwardAdditionalCharges_prepaid',
+    'forwardAdditionalCharges_postpaid'
 ]
 MONEY_COLS_SALES = [
     'invoiceamount','shipment_value','base_value','seller_price','mrp',
@@ -868,7 +870,7 @@ with t_checker:
     st.markdown("""
     <div style="background:#f0f9ff;border-left:4px solid #3b82f6;padding:12px 16px;border-radius:4px;margin-bottom:16px;font-size:0.9rem;">
     <b>Formula applied per order:</b><br>
-    <code>Calculated Payment = seller_price (Sales) − total_commission_plus_tcs_tds_deduction − total_logistics_deduction</code><br><br>
+    <code>Calculated Payment = seller_price − total_commission_plus_tcs_tds_deduction − total_logistics_deduction − forwardAdditionalCharges_prepaid − forwardAdditionalCharges_postpaid</code><br><br>
     <b>Settlement Check:</b> Calculated Payment is then compared against <code>total_actual_settlement</code> (PG Forward Col AO).<br>
     Orders are flagged as ✅ Matched, ⚠️ Difference, or 🕐 Pending based on the gap.
     </div>
@@ -911,6 +913,7 @@ with t_checker:
     # Build PG Forward working set
     needed_pg = ['order_release_id', 'packet_id', 'sku_code', 'article_type',
                  'total_commission_plus_tcs_tds_deduction', 'total_logistics_deduction',
+                 'forwardAdditionalCharges_prepaid', 'forwardAdditionalCharges_postpaid',
                  'total_actual_settlement', 'total_expected_settlement',
                  'amount_pending_settlement', 'seller_product_amount']
     available_pg = [c for c in needed_pg if c in pg_fwd.columns]
@@ -935,6 +938,8 @@ with t_checker:
 
     checker_df['comm_tcs_tds']   = safe_num(checker_df['total_commission_plus_tcs_tds_deduction']).abs()
     checker_df['logistics']      = safe_num(checker_df['total_logistics_deduction']).abs()
+    checker_df['add_prepaid']    = safe_num(checker_df.get('forwardAdditionalCharges_prepaid',  pd.Series(0, index=checker_df.index))).abs()
+    checker_df['add_postpaid']   = safe_num(checker_df.get('forwardAdditionalCharges_postpaid', pd.Series(0, index=checker_df.index))).abs()
     checker_df['seller_price']   = safe_num(checker_df['seller_price'])
     checker_df['actual_settle']  = safe_num(checker_df['total_actual_settlement'])
     checker_df['expected_settle']= safe_num(checker_df.get('total_expected_settlement', 0))
@@ -942,7 +947,11 @@ with t_checker:
 
     # Core formula
     checker_df['Calculated_Payment'] = (
-        checker_df['seller_price'] - checker_df['comm_tcs_tds'] - checker_df['logistics']
+        checker_df['seller_price']
+        - checker_df['comm_tcs_tds']
+        - checker_df['logistics']
+        - checker_df['add_prepaid']
+        - checker_df['add_postpaid']
     ).round(2)
 
     checker_df['Difference_Rs'] = (
@@ -1028,6 +1037,7 @@ with t_checker:
     show_cols = [
         'order_release_id', 'packet_id', 'sku_code',
         'seller_price', 'comm_tcs_tds', 'logistics',
+        'add_prepaid', 'add_postpaid',
         'Calculated_Payment', 'actual_settle', 'Difference_Rs',
         'pending', 'Status'
     ]
@@ -1040,6 +1050,8 @@ with t_checker:
         'seller_price':       'Seller Price (₹)',
         'comm_tcs_tds':       'Commission+TCS+TDS (₹)',
         'logistics':          'Logistics (₹)',
+        'add_prepaid':        'Fwd Additional (Prepaid) (₹)',
+        'add_postpaid':       'Fwd Additional (Postpaid) (₹)',
         'Calculated_Payment': 'Calculated Payment (₹)',
         'actual_settle':      'Actual Settlement (₹)',
         'Difference_Rs':      'Difference (₹)',
@@ -1057,7 +1069,7 @@ with t_checker:
         st.markdown("""
 | Step | Formula |
 |------|---------|
-| **Calculated Payment** | `Seller Price` − `total_commission_plus_tcs_tds_deduction` − `total_logistics_deduction` |
+| **Calculated Payment** | `Seller Price` − `total_commission_plus_tcs_tds_deduction` − `total_logistics_deduction` − `forwardAdditionalCharges_prepaid` − `forwardAdditionalCharges_postpaid` |
 | **Difference** | `Calculated Payment` − `total_actual_settlement` |
 | **✅ Matched** | |Difference| ≤ ₹2 (rounding tolerance) |
 | **⚠️ Underpaid** | Difference > ₹2 (you received less than calculated) |
@@ -1068,6 +1080,8 @@ with t_checker:
         st.markdown("- `Seller Price` → Sales Sheet, Column F (order_release_id) joined with Column AU (seller_price)")
         st.markdown("- `total_commission_plus_tcs_tds_deduction` → PG Forward report (Expenses)")
         st.markdown("- `total_logistics_deduction` → PG Forward report")
+        st.markdown("- `forwardAdditionalCharges_prepaid` → PG Forward report")
+        st.markdown("- `forwardAdditionalCharges_postpaid` → PG Forward report")
         st.markdown("- `total_actual_settlement` → PG Forward report, Column AO")
 
     # ── Summary by status ──

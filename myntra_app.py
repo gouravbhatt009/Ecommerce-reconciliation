@@ -1080,11 +1080,17 @@ with t_checker:
         display_df = display_df[display_df['Difference_Rs'].abs() > diff_thresh]
 
     # ── Main table ──
+    # Pick SKU col — prefer 'SKU', fallback 'sku_code', never both (avoids duplicate col names)
+    sku_col = 'SKU' if 'SKU' in display_df.columns else ('sku_code' if 'sku_code' in display_df.columns else None)
     show_cols = ['order_release_id']
-    for c in ['packet_id','SKU','sku_code','sales_order_status','payment_method']:
-        if c in display_df.columns: show_cols.append(c)
+    for c in ['packet_id', sku_col, 'sales_order_status', 'payment_method']:
+        if c and c in display_df.columns:
+            show_cols.append(c)
     show_cols += ['seller_price','comm_tcs_tds','logistics','add_prepaid','add_postpaid',
                   'Calculated_Payment','actual_settle','Difference_Rs','pending','Status']
+    # Deduplicate while preserving order, then keep only cols that exist
+    seen = set()
+    show_cols = [c for c in show_cols if c not in seen and not seen.add(c)]
     show_cols = [c for c in show_cols if c in display_df.columns]
 
     rename_map = {
@@ -1105,8 +1111,10 @@ with t_checker:
         'pending':           'Pending (₹)',
         'Status':            'Status'
     }
-    st.dataframe(display_df[show_cols].rename(columns=rename_map),
-                 use_container_width=True, hide_index=True)
+    # Final safety: drop any duplicate column names before passing to st.dataframe
+    out_df = display_df[show_cols].rename(columns=rename_map)
+    out_df = out_df.loc[:, ~out_df.columns.duplicated()]
+    st.dataframe(out_df, use_container_width=True, hide_index=True)
     st.caption(f"Showing **{len(display_df):,}** of {total:,} Sales orders")
 
     # ── Dedicated table: Payment Not Received ──
@@ -1125,8 +1133,9 @@ with t_checker:
             'invoiceamount':     'Invoice Amount (₹)',
             'article_type':      'Article Type'
         }
-        st.dataframe(not_recv_df[nr_cols].rename(columns=nr_rename),
-                     use_container_width=True, hide_index=True)
+        _nr_out = not_recv_df[nr_cols].rename(columns=nr_rename)
+        _nr_out = _nr_out.loc[:, ~_nr_out.columns.duplicated()]
+        st.dataframe(_nr_out, use_container_width=True, hide_index=True)
         m1, m2 = st.columns(2)
         m1.metric("Orders with No Payment", f"{len(not_recv_df):,}")
         m2.metric("Total Seller Price at Risk", f"₹{not_recv_df['seller_price'].sum():,.2f}")
@@ -1151,8 +1160,9 @@ with t_checker:
             'actual_settle':     'Actual Settlement (₹)',
             'pending':           'Amount Pending (₹)'
         }
-        st.dataframe(pend_df[p_cols].rename(columns=p_rename),
-                     use_container_width=True, hide_index=True)
+        _p_out = pend_df[p_cols].rename(columns=p_rename)
+        _p_out = _p_out.loc[:, ~_p_out.columns.duplicated()]
+        st.dataframe(_p_out, use_container_width=True, hide_index=True)
         st.metric("Total Pending Amount", f"₹{pend_df['pending'].sum():,.2f}")
         st.download_button("📥 Export – Pending Settlement (Excel)",
             data=to_excel(pend_df[p_cols].rename(columns=p_rename)),
@@ -1169,6 +1179,7 @@ with t_checker:
         Total_Difference=('Difference_Rs','sum'),
         Total_Pending=('pending','sum'),
     ).reset_index().round(2)
+    summary = summary.loc[:, ~summary.columns.duplicated()]
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
     # ── Full export ──

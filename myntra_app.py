@@ -103,42 +103,31 @@ def safe_num(series):
     return pd.to_numeric(series, errors='coerce').fillna(0)
 
 # ─────────────────────────────────────────────
-# Load data
+# Helper: coerce numeric columns
 # ─────────────────────────────────────────────
-@st.cache_data
-def load_data():
-    pg_fwd = pd.read_csv("PG_Forward_Jan-26.csv")
-    pg_rev = pd.read_csv("PG_Reverse_Jan-26.csv")
-    sales  = pd.read_excel("Sales_Jan-26_-_Copy.xlsx")
+MONEY_COLS_PG = [
+    'seller_product_amount','mrp','total_discount_amount','total_commission',
+    'total_logistics_deduction','total_expected_settlement','total_actual_settlement',
+    'amount_pending_settlement','prepaid_amount','postpaid_amount',
+    'tcs_amount','tds_amount','commission_percentage','platform_fees',
+    'shipping_fee','customer_paid_amt','taxable_amount',
+    'prepaid_payment','postpaid_payment'
+]
+MONEY_COLS_SALES = [
+    'invoiceamount','shipment_value','base_value','seller_price','mrp',
+    'discount','tax_amount','tcs_amount','tds_amount','net_amount'
+]
 
-    # Numeric coerce for key columns
-    money_cols_fwd = ['seller_product_amount','mrp','total_discount_amount','total_commission',
-                      'total_logistics_deduction','total_expected_settlement','total_actual_settlement',
-                      'amount_pending_settlement','prepaid_amount','postpaid_amount',
-                      'tcs_amount','tds_amount','commission_percentage','platform_fees',
-                      'shipping_fee','customer_paid_amt','taxable_amount',
-                      'prepaid_payment','postpaid_payment']
-    for c in money_cols_fwd:
-        if c in pg_fwd.columns: pg_fwd[c] = safe_num(pg_fwd[c])
-        if c in pg_rev.columns: pg_rev[c] = safe_num(pg_rev[c])
-
-    sales_money = ['invoiceamount','shipment_value','base_value','seller_price','mrp',
-                   'discount','tax_amount','tcs_amount','tds_amount','net_amount']
-    for c in sales_money:
-        if c in sales.columns: sales[c] = safe_num(sales[c])
-
-    pg_fwd['packet_id'] = pg_fwd['packet_id'].astype(str)
-    pg_rev['packet_id'] = pg_rev['packet_id'].astype(str)
-    sales['packet_id']  = sales['packet_id'].astype(str)
-
-    # Add type tag
-    pg_fwd['_type'] = 'Forward'
-    pg_rev['_type'] = 'Return'
-
-    return pg_fwd, pg_rev, sales
+def coerce_df(df, money_cols):
+    for c in money_cols:
+        if c in df.columns:
+            df[c] = safe_num(df[c])
+    if 'packet_id' in df.columns:
+        df['packet_id'] = df['packet_id'].astype(str)
+    return df
 
 # ─────────────────────────────────────────────
-# Upload OR use sample
+# Header
 # ─────────────────────────────────────────────
 st.markdown("""
 <div class="main-header">
@@ -148,42 +137,42 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Sidebar — file upload
+# ─────────────────────────────────────────────
+# Sidebar — file upload (always shown)
+# ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 📂 Data Files")
     st.markdown("Upload your Myntra PG reports and Sales sheet:")
-    up_fwd   = st.file_uploader("PG Forward (Sales) CSV",    type=["csv"])
-    up_rev   = st.file_uploader("PG Reverse (Returns) CSV",  type=["csv"])
-    up_sales = st.file_uploader("Sales Sheet (XLSX/CSV)",    type=["xlsx","csv","xls"])
-    use_sample = st.button("▶️ Use Sample Data (Jan-26)", use_container_width=True)
+    up_fwd   = st.file_uploader("PG Forward (Sales) CSV",   type=["csv"])
+    up_rev   = st.file_uploader("PG Reverse (Returns) CSV", type=["csv"])
+    up_sales = st.file_uploader("Sales Sheet (XLSX/CSV)",   type=["xlsx","csv","xls"])
     st.markdown("---")
     st.markdown("**About this Dashboard**")
     st.caption("Analyzes Myntra PG Forward/Reverse reports with Sales data for order-wise payment reconciliation.")
 
-# Load
+# ─────────────────────────────────────────────
+# Load — only from uploads, no local fallback
+# ─────────────────────────────────────────────
+if not (up_fwd and up_rev and up_sales):
+    st.info(
+        "👈 **Please upload all three files in the sidebar to get started:**\n\n"
+        "1. **PG Forward (Sales) CSV** — your `PG_Forward_*.csv`\n"
+        "2. **PG Reverse (Returns) CSV** — your `PG_Reverse_*.csv`\n"
+        "3. **Sales Sheet** — your `Sales_*.xlsx` or `.csv`"
+    )
+    st.stop()
+
 try:
-    if up_fwd and up_rev and up_sales:
-        pg_fwd = pd.read_csv(up_fwd)
-        pg_rev = pd.read_csv(up_rev)
-        pg_sales = pd.read_excel(up_sales) if up_sales.name.endswith(('xlsx','xls')) else pd.read_csv(up_sales)
-        for c in ['seller_product_amount','mrp','total_discount_amount','total_commission',
-                  'total_logistics_deduction','total_expected_settlement','total_actual_settlement',
-                  'amount_pending_settlement','prepaid_amount','postpaid_amount','tcs_amount','tds_amount',
-                  'commission_percentage','platform_fees','shipping_fee','customer_paid_amt',
-                  'prepaid_payment','postpaid_payment']:
-            if c in pg_fwd.columns: pg_fwd[c] = safe_num(pg_fwd[c])
-            if c in pg_rev.columns: pg_rev[c] = safe_num(pg_rev[c])
-        pg_fwd['packet_id'] = pg_fwd['packet_id'].astype(str)
-        pg_rev['packet_id'] = pg_rev['packet_id'].astype(str)
-        pg_sales['packet_id'] = pg_sales['packet_id'].astype(str)
-        pg_fwd['_type'] = 'Forward'; pg_rev['_type'] = 'Return'
-        sales = pg_sales
-        DATA_LOADED = True
+    pg_fwd  = coerce_df(pd.read_csv(up_fwd), MONEY_COLS_PG)
+    pg_rev  = coerce_df(pd.read_csv(up_rev), MONEY_COLS_PG)
+    if up_sales.name.lower().endswith(('.xlsx', '.xls')):
+        sales = coerce_df(pd.read_excel(up_sales), MONEY_COLS_SALES)
     else:
-        pg_fwd, pg_rev, sales = load_data()
-        DATA_LOADED = True
+        sales = coerce_df(pd.read_csv(up_sales), MONEY_COLS_SALES)
+    pg_fwd['_type'] = 'Forward'
+    pg_rev['_type'] = 'Return'
 except Exception as e:
-    st.warning(f"Could not load sample data from local path. Upload files using sidebar. ({e})")
+    st.error(f"❌ Error reading uploaded files: {e}")
     st.stop()
 
 # ─────────────────────────────────────────────

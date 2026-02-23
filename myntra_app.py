@@ -903,12 +903,28 @@ with t_checker:
             st.error("❌ Could not find seller_price column in Sales sheet. Please check column AU.")
             st.stop()
 
-    # Build sales lookup: order_id → seller_price
-    sales_lookup = sales[[sales_id_col, sales_price_col]].copy()
-    sales_lookup[sales_id_col]   = sales_lookup[sales_id_col].astype(str).str.strip()
+    # Build sales lookup: order_id → seller_price + order_status
+    # Grab order_status column if available (for pending detection from sales side)
+    sales_status_col = None
+    for cand in ['order_status', 'Order_Status', 'orderstatus']:
+        if cand in sales.columns:
+            sales_status_col = cand
+            break
+
+    sales_cols_needed = [sales_id_col, sales_price_col]
+    if sales_status_col:
+        sales_cols_needed.append(sales_status_col)
+
+    sales_lookup = sales[sales_cols_needed].copy()
+    sales_lookup[sales_id_col]    = sales_lookup[sales_id_col].astype(str).str.strip()
     sales_lookup[sales_price_col] = safe_num(sales_lookup[sales_price_col])
     sales_lookup = sales_lookup.drop_duplicates(subset=[sales_id_col])
-    sales_lookup.columns = ['order_release_id', 'seller_price']
+    rename_sales = {'order_release_id': 'order_release_id', 'seller_price': 'seller_price'}
+    sales_lookup.columns = (
+        ['order_release_id', 'seller_price', 'sales_order_status']
+        if sales_status_col else
+        ['order_release_id', 'seller_price']
+    )
 
     # Build PG Forward working set
     needed_pg = ['order_release_id', 'packet_id', 'sku_code', 'article_type',
@@ -920,32 +936,38 @@ with t_checker:
     pg_work = pg_fwd[available_pg].copy()
     pg_work['order_release_id'] = pg_work['order_release_id'].astype(str).str.strip()
 
-    # Merge
-    checker_df = pg_work.merge(sales_lookup, on='order_release_id', how='left')
+    # ── OUTER JOIN: catches ALL orders from both sides ──
+    checker_df = pg_work.merge(sales_lookup, on='order_release_id', how='outer', indicator=True)
+
+    # Tag source
+    checker_df['_source'] = checker_df['_merge'].map({
+        'both':       'Both',
+        'left_only':  'PG Only',       # in PG Forward, not in Sales
+        'right_only': 'Sales Only',    # in Sales, NOT in PG Forward ← the missing case
+    })
 
     # ── Apply formula ──
-    # If total_commission_plus_tcs_tds_deduction is missing, build it from components
     if 'total_commission_plus_tcs_tds_deduction' not in checker_df.columns or checker_df['total_commission_plus_tcs_tds_deduction'].fillna(0).abs().sum() == 0:
         for c in ['total_commission', 'tcs_amount', 'tds_amount']:
             if c not in checker_df.columns:
                 checker_df[c] = 0
         checker_df['total_commission_plus_tcs_tds_deduction'] = (
-            safe_num(checker_df.get('total_commission', 0)).abs() +
-            safe_num(checker_df.get('tcs_amount', 0)).abs() +
-            safe_num(checker_df.get('tds_amount', 0)).abs()
+            safe_num(checker_df.get('total_commission', pd.Series(0, index=checker_df.index))).abs() +
+            safe_num(checker_df.get('tcs_amount',       pd.Series(0, index=checker_df.index))).abs() +
+            safe_num(checker_df.get('tds_amount',       pd.Series(0, index=checker_df.index))).abs()
         )
-        st.info("ℹ️ `total_commission_plus_tcs_tds_deduction` column not found — computed from commission + TCS + TDS.")
+        st.info("ℹ️ `total_commission_plus_tcs_tds_deduction` not found — computed from commission + TCS + TDS.")
 
-    checker_df['comm_tcs_tds']   = safe_num(checker_df['total_commission_plus_tcs_tds_deduction']).abs()
-    checker_df['logistics']      = safe_num(checker_df['total_logistics_deduction']).abs()
-    checker_df['add_prepaid']    = safe_num(checker_df.get('forwardAdditionalCharges_prepaid',  pd.Series(0, index=checker_df.index))).abs()
-    checker_df['add_postpaid']   = safe_num(checker_df.get('forwardAdditionalCharges_postpaid', pd.Series(0, index=checker_df.index))).abs()
-    checker_df['seller_price']   = safe_num(checker_df['seller_price'])
-    checker_df['actual_settle']  = safe_num(checker_df['total_actual_settlement'])
-    checker_df['expected_settle']= safe_num(checker_df.get('total_expected_settlement', 0))
-    checker_df['pending']        = safe_num(checker_df.get('amount_pending_settlement', 0))
+    checker_df['comm_tcs_tds']    = safe_num(checker_df.get('total_commission_plus_tcs_tds_deduction', 0)).abs()
+    checker_df['logistics']       = safe_num(checker_df.get('total_logistics_deduction', 0)).abs()
+    checker_df['add_prepaid']     = safe_num(checker_df.get('forwardAdditionalCharges_prepaid',  pd.Series(0, index=checker_df.index))).abs()
+    checker_df['add_postpaid']    = safe_num(checker_df.get('forwardAdditionalCharges_postpaid', pd.Series(0, index=checker_df.index))).abs()
+    checker_df['seller_price']    = safe_num(checker_df.get('seller_price', 0))
+    checker_df['actual_settle']   = safe_num(checker_df.get('total_actual_settlement', 0))
+    checker_df['expected_settle'] = safe_num(checker_df.get('total_expected_settlement', 0))
+    checker_df['pending']         = safe_num(checker_df.get('amount_pending_settlement', 0))
 
-    # Core formula
+    # Core formula (only meaningful when PG data exists)
     checker_df['Calculated_Payment'] = (
         checker_df['seller_price']
         - checker_df['comm_tcs_tds']
@@ -958,53 +980,85 @@ with t_checker:
         checker_df['Calculated_Payment'] - checker_df['actual_settle']
     ).round(2)
 
-    # Status classification
+    # ── Status classification (updated) ──
     def settlement_status(row):
-        if abs(row['Difference_Rs']) <= 2:          # allow ₹2 rounding tolerance
-            return '✅ Matched'
-        elif row['pending'] > 0:
-            return '🕐 Settlement Pending'
-        elif row['seller_price'] == 0:
+        src = row.get('_source', 'Both')
+
+        # Order in Sales but ZERO presence in PG Forward → payment never received
+        if src == 'Sales Only':
+            return '🚨 In Sales – Payment Not Received'
+
+        # Order in PG Forward but not in Sales sheet
+        if src == 'PG Only':
+            if row['pending'] > 0:
+                return '🕐 Settlement Pending'
+            if abs(row['Difference_Rs']) <= 2:
+                return '✅ Matched'
             return '❓ No Sales Data'
-        elif row['Difference_Rs'] > 2:
+
+        # Both sides present
+        if row['seller_price'] == 0:
+            return '❓ No Sales Data'
+        if row['pending'] > 0:
+            return '🕐 Settlement Pending'
+        if abs(row['Difference_Rs']) <= 2:
+            return '✅ Matched'
+        if row['Difference_Rs'] > 2:
             return '⚠️ Underpaid'
-        else:
-            return '⚠️ Overpaid / Deduction Higher'
+        return '⚠️ Overpaid / Deduction Higher'
 
     checker_df['Status'] = checker_df.apply(settlement_status, axis=1)
 
     # ── Summary KPIs ──
-    total_orders  = len(checker_df)
-    matched       = (checker_df['Status'] == '✅ Matched').sum()
-    underpaid     = (checker_df['Status'] == '⚠️ Underpaid').sum()
-    overpaid      = (checker_df['Status'] == '⚠️ Overpaid / Deduction Higher').sum()
-    pending_count = (checker_df['Status'] == '🕐 Settlement Pending').sum()
-    no_data       = (checker_df['Status'] == '❓ No Sales Data').sum()
-    total_diff    = checker_df['Difference_Rs'].sum()
+    total_orders    = len(checker_df)
+    matched         = (checker_df['Status'] == '✅ Matched').sum()
+    underpaid       = (checker_df['Status'] == '⚠️ Underpaid').sum()
+    overpaid        = (checker_df['Status'] == '⚠️ Overpaid / Deduction Higher').sum()
+    pending_count   = (checker_df['Status'] == '🕐 Settlement Pending').sum()
+    not_received    = (checker_df['Status'] == '🚨 In Sales – Payment Not Received').sum()
+    no_data         = (checker_df['Status'] == '❓ No Sales Data').sum()
+    total_diff      = checker_df.loc[checker_df['_source'] != 'Sales Only', 'Difference_Rs'].sum()
+    not_received_val= checker_df.loc[checker_df['Status'] == '🚨 In Sales – Payment Not Received', 'seller_price'].sum()
 
-    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    k1,k2,k3,k4,k5,k6,k7 = st.columns(7)
     k1.markdown(f"""<div class="kpi-card blue">
         <div class="kpi-label">Total Orders</div>
-        <div class="kpi-value">{total_orders:,}</div></div>""", unsafe_allow_html=True)
+        <div class="kpi-value">{total_orders:,}</div>
+        <div class="kpi-sub">Sales + PG combined</div></div>""", unsafe_allow_html=True)
     k2.markdown(f"""<div class="kpi-card green">
         <div class="kpi-label">✅ Matched</div>
         <div class="kpi-value">{matched:,}</div>
-        <div class="kpi-sub">{matched/total_orders*100:.1f}%</div></div>""", unsafe_allow_html=True)
+        <div class="kpi-sub">{matched/max(total_orders,1)*100:.1f}%</div></div>""", unsafe_allow_html=True)
     k3.markdown(f"""<div class="kpi-card red">
+        <div class="kpi-label">🚨 Not Received</div>
+        <div class="kpi-value">{not_received:,}</div>
+        <div class="kpi-sub">₹{not_received_val:,.0f} at risk</div></div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi-card red">
         <div class="kpi-label">⚠️ Underpaid</div>
         <div class="kpi-value">{underpaid:,}</div></div>""", unsafe_allow_html=True)
-    k4.markdown(f"""<div class="kpi-card orange">
+    k5.markdown(f"""<div class="kpi-card orange">
         <div class="kpi-label">⚠️ Overpaid</div>
         <div class="kpi-value">{overpaid:,}</div></div>""", unsafe_allow_html=True)
-    k5.markdown(f"""<div class="kpi-card">
+    k6.markdown(f"""<div class="kpi-card">
         <div class="kpi-label">🕐 Pending</div>
         <div class="kpi-value">{pending_count:,}</div></div>""", unsafe_allow_html=True)
-    k6.markdown(f"""<div class="kpi-card {'red' if total_diff < 0 else 'green'}">
+    k7.markdown(f"""<div class="kpi-card {'red' if total_diff < 0 else 'green'}">
         <div class="kpi-label">Net Diff (Calc − Actual)</div>
         <div class="kpi-value">₹{total_diff:,.0f}</div>
         <div class="kpi-sub">{'Shortfall' if total_diff < 0 else 'Surplus'}</div></div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Alert box for not-received orders ──
+    if not_received > 0:
+        st.markdown(f"""
+        <div style="background:#fef2f2;border:1px solid #ef4444;border-left:5px solid #ef4444;
+             padding:14px 18px;border-radius:6px;margin-bottom:16px;">
+        <b>🚨 {not_received} order(s) found in Sales report but have NO entry in PG Forward report.</b><br>
+        These orders were dispatched (sale recorded) but Myntra has not processed any payment yet.<br>
+        <b>Total Seller Price at risk: ₹{not_received_val:,.2f}</b>
+        </div>
+        """, unsafe_allow_html=True)
 
     # ── Filters ──
     col_f1, col_f2, col_f3 = st.columns(3)
@@ -1026,8 +1080,8 @@ with t_checker:
     if search_order:
         mask = (
             display_df['order_release_id'].astype(str).str.contains(search_order, case=False, na=False) |
-            display_df['packet_id'].astype(str).str.contains(search_order, case=False, na=False) |
-            display_df.get('sku_code', pd.Series(dtype=str)).astype(str).str.contains(search_order, case=False, na=False)
+            display_df.get('packet_id', pd.Series(dtype=str)).astype(str).str.contains(search_order, case=False, na=False) |
+            display_df.get('sku_code',  pd.Series(dtype=str)).astype(str).str.contains(search_order, case=False, na=False)
         )
         display_df = display_df[mask]
     if diff_threshold > 0:
@@ -1035,7 +1089,7 @@ with t_checker:
 
     # ── Main table ──
     show_cols = [
-        'order_release_id', 'packet_id', 'sku_code',
+        'order_release_id', 'packet_id', 'sku_code', '_source',
         'seller_price', 'comm_tcs_tds', 'logistics',
         'add_prepaid', 'add_postpaid',
         'Calculated_Payment', 'actual_settle', 'Difference_Rs',
@@ -1047,11 +1101,12 @@ with t_checker:
         'order_release_id':   'Order ID',
         'packet_id':          'Packet ID',
         'sku_code':           'SKU',
+        '_source':            'Source',
         'seller_price':       'Seller Price (₹)',
         'comm_tcs_tds':       'Commission+TCS+TDS (₹)',
         'logistics':          'Logistics (₹)',
-        'add_prepaid':        'Fwd Additional (Prepaid) (₹)',
-        'add_postpaid':       'Fwd Additional (Postpaid) (₹)',
+        'add_prepaid':        'Fwd Additional Prepaid (₹)',
+        'add_postpaid':       'Fwd Additional Postpaid (₹)',
         'Calculated_Payment': 'Calculated Payment (₹)',
         'actual_settle':      'Actual Settlement (₹)',
         'Difference_Rs':      'Difference (₹)',
@@ -1064,25 +1119,53 @@ with t_checker:
     )
     st.caption(f"Showing **{len(display_df):,}** of {total_orders:,} orders  |  Tolerance: ±₹2 for 'Matched'")
 
+    # ── Dedicated sub-table: Sales orders with no PG payment ──
+    not_recv_df = checker_df[checker_df['Status'] == '🚨 In Sales – Payment Not Received'].copy()
+    if not not_recv_df.empty:
+        st.markdown('<div class="section-title">🚨 Sales Orders – Payment Not Yet Received from Myntra</div>', unsafe_allow_html=True)
+        st.markdown("These orders are **present in your Sales sheet** but have **no record in the PG Forward report** — meaning Myntra has not initiated any settlement for them.")
+        nr_cols = ['order_release_id', 'seller_price']
+        if 'sales_order_status' in not_recv_df.columns:
+            nr_cols.append('sales_order_status')
+        nr_show = [c for c in nr_cols if c in not_recv_df.columns]
+        nr_rename = {
+            'order_release_id':   'Order ID',
+            'seller_price':       'Seller Price (₹)',
+            'sales_order_status': 'Order Status (Sales)',
+        }
+        st.dataframe(not_recv_df[nr_show].rename(columns=nr_rename), use_container_width=True, hide_index=True)
+        st.metric("Total Seller Price — Not Received", f"₹{not_recv_df['seller_price'].sum():,.2f}")
+        st.download_button(
+            "📥 Export Not-Received Orders",
+            data=to_excel(not_recv_df[nr_show].rename(columns=nr_rename)),
+            file_name="payment_not_received.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     # ── Formula breakdown expander ──
-    with st.expander("📐 Formula Reference"):
+    with st.expander("📐 Formula & Status Reference"):
         st.markdown("""
-| Step | Formula |
-|------|---------|
-| **Calculated Payment** | `Seller Price` − `total_commission_plus_tcs_tds_deduction` − `total_logistics_deduction` − `forwardAdditionalCharges_prepaid` − `forwardAdditionalCharges_postpaid` |
-| **Difference** | `Calculated Payment` − `total_actual_settlement` |
-| **✅ Matched** | |Difference| ≤ ₹2 (rounding tolerance) |
-| **⚠️ Underpaid** | Difference > ₹2 (you received less than calculated) |
-| **⚠️ Overpaid** | Difference < −₹2 (more deducted than expected) |
-| **🕐 Pending** | `amount_pending_settlement` > 0 |
+| Status | Meaning |
+|--------|---------|
+| ✅ Matched | Difference ≤ ₹2 — payment matches formula |
+| 🚨 In Sales – Payment Not Received | Order in Sales sheet, **zero entry in PG Forward** — Myntra hasn't paid |
+| ⚠️ Underpaid | You received less than the formula calculated |
+| ⚠️ Overpaid | More was deducted than expected |
+| 🕐 Settlement Pending | amount_pending_settlement > 0 in PG Forward |
+| ❓ No Sales Data | In PG Forward but no matching Sales record |
+
+**Formula:**
+`Calculated Payment = Seller Price − Commission+TCS+TDS − Logistics − Fwd Additional (Prepaid) − Fwd Additional (Postpaid)`
+
+`Difference = Calculated Payment − total_actual_settlement (Col AO)`
         """)
         st.markdown("**Column sources:**")
-        st.markdown("- `Seller Price` → Sales Sheet, Column F (order_release_id) joined with Column AU (seller_price)")
-        st.markdown("- `total_commission_plus_tcs_tds_deduction` → PG Forward report (Expenses)")
-        st.markdown("- `total_logistics_deduction` → PG Forward report")
-        st.markdown("- `forwardAdditionalCharges_prepaid` → PG Forward report")
-        st.markdown("- `forwardAdditionalCharges_postpaid` → PG Forward report")
-        st.markdown("- `total_actual_settlement` → PG Forward report, Column AO")
+        st.markdown("- `Seller Price` → Sales Sheet Col F (order_release_id) × Col AU (seller_price)")
+        st.markdown("- `total_commission_plus_tcs_tds_deduction` → PG Forward (Expenses)")
+        st.markdown("- `total_logistics_deduction` → PG Forward")
+        st.markdown("- `forwardAdditionalCharges_prepaid` → PG Forward")
+        st.markdown("- `forwardAdditionalCharges_postpaid` → PG Forward")
+        st.markdown("- `total_actual_settlement` → PG Forward Col AO")
 
     # ── Summary by status ──
     st.markdown('<div class="section-title">📊 Summary by Status</div>', unsafe_allow_html=True)
@@ -1096,7 +1179,7 @@ with t_checker:
     summary = summary.round(2)
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    # ── Export ──
+        # ── Export ──
     export_df = display_df[show_cols].rename(columns=rename_map)
     ec1, ec2 = st.columns(2)
     with ec1:

@@ -7,8 +7,76 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import io
+import json
+import uuid
 import warnings
 warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+# SUPABASE SETUP
+# ─────────────────────────────────────────────
+try:
+    from supabase import create_client
+    _url = st.secrets.get("SUPABASE_URL", "")
+    _key = st.secrets.get("SUPABASE_KEY", "")
+    supabase = create_client(_url, _key) if (_url and _key) else None
+    SUPABASE_OK = bool(supabase)
+except Exception:
+    supabase = None
+    SUPABASE_OK = False
+
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())[:8]
+
+# ─────────────────────────────────────────────
+# SUPABASE HELPERS
+# ─────────────────────────────────────────────
+def sb_save_df(df, table, chunk=400):
+    """Save DataFrame to Supabase table in chunks. Returns rows saved."""
+    if not SUPABASE_OK or df.empty: return 0
+    records = df.where(pd.notnull(df), None).to_dict("records")
+    saved = 0
+    for i in range(0, len(records), chunk):
+        try:
+            supabase.table(table).insert(records[i:i+chunk]).execute()
+            saved += len(records[i:i+chunk])
+        except Exception as e:
+            st.warning(f"DB error: {e}")
+            break
+    return saved
+
+def sb_load_df(table, limit=5000):
+    """Load DataFrame from Supabase table."""
+    if not SUPABASE_OK: return pd.DataFrame()
+    try:
+        res = supabase.table(table).select("*").limit(limit).execute()
+        return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+    except Exception as e:
+        st.warning(f"Load error: {e}")
+        return pd.DataFrame()
+
+def sb_save_report_meta(report_name, table_ref, rows, month_label):
+    """Save report metadata/audit entry."""
+    if not SUPABASE_OK: return
+    try:
+        supabase.table("saved_reports").insert({
+            "report_name":  report_name,
+            "table_ref":    table_ref,
+            "rows":         rows,
+            "month_label":  month_label,
+            "saved_at":     datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception as e:
+        st.warning(f"Report log error: {e}")
+
+def sb_get_reports():
+    """Get list of all saved reports."""
+    if not SUPABASE_OK: return pd.DataFrame()
+    try:
+        res = supabase.table("saved_reports").select("*").order("saved_at", desc=True).execute()
+        return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 st.set_page_config(
     page_title="Myntra Seller Dashboard",
@@ -257,9 +325,10 @@ tabs = st.tabs([
     "🌍 Geography",
     "💸 Charges Breakup",
     "✅ Order Settlement Checker",
+    "💾 Save & Reports",
 ])
 (t_overview, t_recon, t_sales, t_returns,
- t_settle, t_sku, t_geo, t_charges, t_checker) = tabs
+ t_settle, t_sku, t_geo, t_charges, t_checker, t_savereports) = tabs
 
 # ══════════════════════════════════════════════
 # TAB 1 — OVERVIEW
@@ -1297,3 +1366,297 @@ with t_checker:
             "Export All Orders (CSV)",
             data=out.to_csv(index=False).encode(),
             file_name="full_order_settlement.csv", mime="text/csv")
+
+# ══════════════════════════════════════════════
+# TAB 10 — SAVE & REPORTS
+# ══════════════════════════════════════════════
+with t_savereports:
+    st.markdown("""
+    <div class="main-header" style="margin-bottom:20px;">
+      <h1>💾 Save Data & Reports</h1>
+      <p>Save your uploaded data to Supabase · View saved reports · Download old data</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not SUPABASE_OK:
+        st.error("""
+        ⚠️ **Supabase not connected.** Add to Streamlit Secrets:
+        ```
+        SUPABASE_URL = "https://your-project.supabase.co"
+        SUPABASE_KEY = "your-anon-key"
+        ```
+        """)
+        st.stop()
+
+    st.success(f"✅ Supabase connected | Session: `{st.session_state['session_id']}`")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Month label for this session ──
+    month_label = st.text_input(
+        "📅 Label for this report (e.g. January 2026, Feb 2026)",
+        value="January 2026",
+        help="This label will appear when you view saved reports later"
+    )
+
+    st.markdown("---")
+
+    # ════════════════════════════════
+    # SECTION 1 — SAVE BUTTONS
+    # ════════════════════════════════
+    st.markdown('<div class="section-title">📤 Save Current Data to Database</div>', unsafe_allow_html=True)
+    st.info("Click the buttons below to save your uploaded files permanently. You can download them anytime later without re-uploading.")
+
+    col1, col2, col3 = st.columns(3)
+
+    # — PG Forward —
+    with col1:
+        st.markdown("""<div class="kpi-card blue">
+        <div class="kpi-label">PG Forward Data</div>
+        <div class="kpi-value" style="font-size:1.2rem;">""" + f"{len(pg_fwd):,} rows" + """</div>
+        <div class="kpi-sub">Payment Gateway Forward</div></div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save PG Forward", use_container_width=True, key="btn_save_fwd"):
+            with st.spinner("Saving PG Forward data..."):
+                save_cols = [c for c in [
+                    'order_release_id','packet_id','sku_code','article_type',
+                    'seller_product_amount','mrp','total_commission',
+                    'total_logistics_deduction','total_actual_settlement',
+                    'amount_pending_settlement','prepaid_amount','postpaid_amount',
+                    'return_type','return_date'
+                ] if c in pg_fwd.columns]
+                df_to_save = pg_fwd[save_cols].copy()
+                df_to_save['month_label'] = month_label
+                df_to_save['saved_at'] = datetime.utcnow().isoformat()
+                n = sb_save_df(df_to_save, "pg_forward_data")
+                if n > 0:
+                    sb_save_report_meta(f"PG Forward – {month_label}", "pg_forward_data", n, month_label)
+                    st.success(f"✅ Saved {n:,} rows!")
+                else:
+                    st.error("❌ Save failed. Check table exists.")
+
+    # — PG Reverse —
+    with col2:
+        st.markdown("""<div class="kpi-card red">
+        <div class="kpi-label">PG Reverse Data</div>
+        <div class="kpi-value" style="font-size:1.2rem;">""" + f"{len(pg_rev):,} rows" + """</div>
+        <div class="kpi-sub">Payment Gateway Reverse</div></div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save PG Reverse", use_container_width=True, key="btn_save_rev"):
+            with st.spinner("Saving PG Reverse data..."):
+                save_cols = [c for c in [
+                    'order_release_id','packet_id','sku_code','article_type',
+                    'return_type','seller_product_amount',
+                    'total_actual_settlement','amount_pending_settlement',
+                    'prepaid_amount','postpaid_amount'
+                ] if c in pg_rev.columns]
+                df_to_save = pg_rev[save_cols].copy()
+                df_to_save['month_label'] = month_label
+                df_to_save['saved_at'] = datetime.utcnow().isoformat()
+                n = sb_save_df(df_to_save, "pg_reverse_data")
+                if n > 0:
+                    sb_save_report_meta(f"PG Reverse – {month_label}", "pg_reverse_data", n, month_label)
+                    st.success(f"✅ Saved {n:,} rows!")
+                else:
+                    st.error("❌ Save failed. Check table exists.")
+
+    # — Sales —
+    with col3:
+        st.markdown("""<div class="kpi-card green">
+        <div class="kpi-label">Sales Data</div>
+        <div class="kpi-value" style="font-size:1.2rem;">""" + f"{len(sales):,} rows" + """</div>
+        <div class="kpi-sub">Sales Sheet</div></div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save Sales Data", use_container_width=True, key="btn_save_sales"):
+            with st.spinner("Saving Sales data..."):
+                save_cols = [c for c in [
+                    'packet_id','order_id','article_type','payment_method',
+                    'invoiceamount','shipment_value','mrp','discount',
+                    'tax_amount','order_status','SKU'
+                ] if c in sales.columns]
+                df_to_save = sales[save_cols].copy()
+                df_to_save['month_label'] = month_label
+                df_to_save['saved_at'] = datetime.utcnow().isoformat()
+                n = sb_save_df(df_to_save, "sales_data")
+                if n > 0:
+                    sb_save_report_meta(f"Sales – {month_label}", "sales_data", n, month_label)
+                    st.success(f"✅ Saved {n:,} rows!")
+                else:
+                    st.error("❌ Save failed. Check table exists.")
+
+    # Save all at once button
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🚀 Save ALL 3 Files at Once", use_container_width=True, type="primary", key="btn_save_all"):
+        total_saved = 0
+        with st.spinner("Saving all data to Supabase..."):
+            progress = st.progress(0)
+
+            # PG Forward
+            save_cols = [c for c in ['order_release_id','packet_id','sku_code','article_type',
+                'seller_product_amount','mrp','total_commission','total_logistics_deduction',
+                'total_actual_settlement','amount_pending_settlement',
+                'prepaid_amount','postpaid_amount'] if c in pg_fwd.columns]
+            df1 = pg_fwd[save_cols].copy()
+            df1['month_label'] = month_label
+            df1['saved_at'] = datetime.utcnow().isoformat()
+            n1 = sb_save_df(df1, "pg_forward_data")
+            if n1: sb_save_report_meta(f"PG Forward – {month_label}", "pg_forward_data", n1, month_label)
+            progress.progress(33)
+
+            # PG Reverse
+            save_cols = [c for c in ['order_release_id','packet_id','sku_code','article_type',
+                'return_type','seller_product_amount','total_actual_settlement',
+                'amount_pending_settlement','prepaid_amount','postpaid_amount'] if c in pg_rev.columns]
+            df2 = pg_rev[save_cols].copy()
+            df2['month_label'] = month_label
+            df2['saved_at'] = datetime.utcnow().isoformat()
+            n2 = sb_save_df(df2, "pg_reverse_data")
+            if n2: sb_save_report_meta(f"PG Reverse – {month_label}", "pg_reverse_data", n2, month_label)
+            progress.progress(66)
+
+            # Sales
+            save_cols = [c for c in ['packet_id','order_id','article_type','payment_method',
+                'invoiceamount','shipment_value','mrp','discount',
+                'tax_amount','order_status'] if c in sales.columns]
+            df3 = sales[save_cols].copy()
+            df3['month_label'] = month_label
+            df3['saved_at'] = datetime.utcnow().isoformat()
+            n3 = sb_save_df(df3, "sales_data")
+            if n3: sb_save_report_meta(f"Sales – {month_label}", "sales_data", n3, month_label)
+            progress.progress(100)
+
+            total_saved = n1 + n2 + n3
+
+        if total_saved > 0:
+            st.success(f"🎉 All saved! PG Forward: {n1:,} | PG Reverse: {n2:,} | Sales: {n3:,} rows")
+        else:
+            st.error("❌ Nothing saved. Make sure tables exist in Supabase.")
+
+    st.markdown("---")
+
+    # ════════════════════════════════
+    # SECTION 2 — VIEW SAVED REPORTS
+    # ════════════════════════════════
+    st.markdown('<div class="section-title">📋 Saved Reports History</div>', unsafe_allow_html=True)
+
+    reports_df = sb_get_reports()
+    if not reports_df.empty:
+        # Summary cards by month
+        months = reports_df['month_label'].unique().tolist() if 'month_label' in reports_df.columns else []
+        if months:
+            st.markdown("**Reports by Month:**")
+            month_cols = st.columns(min(len(months), 4))
+            for i, m in enumerate(months):
+                mdf = reports_df[reports_df['month_label'] == m]
+                with month_cols[i % 4]:
+                    st.markdown(f"""<div class="kpi-card">
+                    <div class="kpi-label">{m}</div>
+                    <div class="kpi-value" style="font-size:1.1rem;">{len(mdf)} files</div>
+                    <div class="kpi-sub">{mdf['rows'].sum():,} total rows</div></div>""",
+                    unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**All Saved Reports:**")
+        display_cols = [c for c in ['report_name','month_label','rows','saved_at'] if c in reports_df.columns]
+        st.dataframe(reports_df[display_cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("No reports saved yet. Upload your files and click Save above!")
+
+    st.markdown("---")
+
+    # ════════════════════════════════
+    # SECTION 3 — DOWNLOAD OLD REPORTS
+    # ════════════════════════════════
+    st.markdown('<div class="section-title">📥 Download Old Reports from Database</div>', unsafe_allow_html=True)
+    st.info("Select which saved data you want to download as Excel or CSV.")
+
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
+
+    with dl_col1:
+        st.markdown("**📦 PG Forward Data**")
+        fwd_db = sb_load_df("pg_forward_data")
+        if not fwd_db.empty:
+            # Month filter
+            if 'month_label' in fwd_db.columns:
+                months_fwd = ['All'] + fwd_db['month_label'].unique().tolist()
+                sel_fwd = st.selectbox("Filter by month", months_fwd, key="dl_fwd_month")
+                if sel_fwd != 'All':
+                    fwd_db = fwd_db[fwd_db['month_label'] == sel_fwd]
+            st.caption(f"{len(fwd_db):,} rows")
+            st.download_button(
+                "⬇️ Download Excel",
+                data=to_excel(fwd_db),
+                file_name=f"pg_forward_{sel_fwd if 'sel_fwd' in dir() else 'all'}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="dl_fwd_xl"
+            )
+            st.download_button(
+                "⬇️ Download CSV",
+                data=fwd_db.to_csv(index=False).encode(),
+                file_name=f"pg_forward_{sel_fwd if 'sel_fwd' in dir() else 'all'}.csv",
+                mime="text/csv", use_container_width=True, key="dl_fwd_csv"
+            )
+        else:
+            st.warning("No PG Forward data saved yet.")
+
+    with dl_col2:
+        st.markdown("**↩️ PG Reverse Data**")
+        rev_db = sb_load_df("pg_reverse_data")
+        if not rev_db.empty:
+            if 'month_label' in rev_db.columns:
+                months_rev = ['All'] + rev_db['month_label'].unique().tolist()
+                sel_rev = st.selectbox("Filter by month", months_rev, key="dl_rev_month")
+                if sel_rev != 'All':
+                    rev_db = rev_db[rev_db['month_label'] == sel_rev]
+            st.caption(f"{len(rev_db):,} rows")
+            st.download_button(
+                "⬇️ Download Excel",
+                data=to_excel(rev_db),
+                file_name=f"pg_reverse_{sel_rev if 'sel_rev' in dir() else 'all'}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="dl_rev_xl"
+            )
+            st.download_button(
+                "⬇️ Download CSV",
+                data=rev_db.to_csv(index=False).encode(),
+                file_name=f"pg_reverse_{sel_rev if 'sel_rev' in dir() else 'all'}.csv",
+                mime="text/csv", use_container_width=True, key="dl_rev_csv"
+            )
+        else:
+            st.warning("No PG Reverse data saved yet.")
+
+    with dl_col3:
+        st.markdown("**🛒 Sales Data**")
+        sales_db = sb_load_df("sales_data")
+        if not sales_db.empty:
+            if 'month_label' in sales_db.columns:
+                months_sales = ['All'] + sales_db['month_label'].unique().tolist()
+                sel_sales = st.selectbox("Filter by month", months_sales, key="dl_sales_month")
+                if sel_sales != 'All':
+                    sales_db = sales_db[sales_db['month_label'] == sel_sales]
+            st.caption(f"{len(sales_db):,} rows")
+            st.download_button(
+                "⬇️ Download Excel",
+                data=to_excel(sales_db),
+                file_name=f"sales_{sel_sales if 'sel_sales' in dir() else 'all'}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="dl_sales_xl"
+            )
+            st.download_button(
+                "⬇️ Download CSV",
+                data=sales_db.to_csv(index=False).encode(),
+                file_name=f"sales_{sel_sales if 'sel_sales' in dir() else 'all'}.csv",
+                mime="text/csv", use_container_width=True, key="dl_sales_csv"
+            )
+        else:
+            st.warning("No Sales data saved yet.")
+
+    st.markdown("---")
+    st.markdown("""
+    > **💡 First time setup?** Make sure these tables exist in Supabase SQL Editor:
+    > ```sql
+    > create table if not exists pg_forward_data (id bigserial primary key, order_release_id text, packet_id text, sku_code text, article_type text, seller_product_amount float, mrp float, total_commission float, total_logistics_deduction float, total_actual_settlement float, amount_pending_settlement float, prepaid_amount float, postpaid_amount float, month_label text, saved_at text);
+    > create table if not exists pg_reverse_data (id bigserial primary key, order_release_id text, packet_id text, sku_code text, article_type text, return_type text, seller_product_amount float, total_actual_settlement float, amount_pending_settlement float, prepaid_amount float, postpaid_amount float, month_label text, saved_at text);
+    > create table if not exists sales_data (id bigserial primary key, packet_id text, order_id text, article_type text, payment_method text, invoiceamount float, shipment_value float, mrp float, discount float, tax_amount float, order_status text, month_label text, saved_at text);
+    > create table if not exists saved_reports (id bigserial primary key, report_name text, table_ref text, rows int, month_label text, saved_at text);
+    > ```
+    """)
